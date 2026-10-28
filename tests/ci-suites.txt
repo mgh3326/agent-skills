@@ -2,6 +2,7 @@
 wrk|bash tests/test-wrk.sh
 suites-a|bash tests/test-wrk-artifacts-move.sh
 suites-a|bash tests/test-wrk-artifacts-routing.sh
+suites-a|bash tests/test-wrk-artifacts-sweep.sh
 suites-a|bash tests/test-wrk-artifact-prune.sh
 suites-a|bash tests/wrk_spillover.sh
 suites-a|bash tests/test-tester-eligible.sh

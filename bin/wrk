@@ -190,6 +190,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-mi
   wrk worktree-reap [--age 3d] [--apply]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE] [--job JOB] [--lane LANE] [--policy PATH]
+  wrk artifacts sweep [--job JOB] [--age AGE] [--policy FILE] [--apply]
   wrk artifacts classify [--job JOB] [--root NAME] [--json]
   wrk artifacts mark-final JOB PATH --by LANE
   wrk find <name-or-label> [--pane-only]
@@ -15245,7 +15246,7 @@ prune_artifact_pass() {
 
 artifacts_help() {
   cat <<'USAGE'
-Usage: wrk artifacts <classify|mark-final|move> [options]
+Usage: wrk artifacts <classify|mark-final|move|sweep> [options]
 
 Commands:
   classify [--job JOB] [--root NAME] [--json]
@@ -15254,6 +15255,8 @@ Commands:
              mark one final build in a job directory
   move SRC_TREE --dest <drive_folder>/<host>/<name> [--apply] [--source-host H]
              upload an artifact tree to the fleet artifact store
+  sweep [--job JOB] [--age AGE] [--policy FILE] [--apply]
+             delete local originals whose drive_confirmed record and manifest match
 
 classify is read-only and reports bytes and paths by class, never-touch,
 conflicts, and heavy unclassified paths. mark-final records one final build.
@@ -15660,6 +15663,7 @@ artifacts_cmd() {
     classify) artifacts_classify_cmd "$@" ;;
     mark-final) artifacts_mark_final_cmd "$@" ;;
     move) artifacts_move_cmd "$@" ;;
+    sweep) artifacts_sweep_cmd "$@" ;;
     -h|--help) artifacts_help ;;
     *) die "unknown artifacts command '$sub'" ;;
   esac
@@ -15929,6 +15933,839 @@ for row in doc.get("quota_pool_records") or []:
 
   echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n quota_release_jobs=$quota_releases refresh_leftovers=$left_n artifact_rows=${PRUNE_ARTIFACT_ROWS:-0} artifact_removed=${PRUNE_ARTIFACT_REMOVED:-0} ($_mode)"
   return "$artifact_rc"
+}
+
+# ── hk 2094: wrk artifacts sweep — the artifact-store host sweep ────────────
+# Design hk:doc designs/b953/artifact-store revision 5 (operator decision
+# r1026driveasis). The mover (hk 2097) or desk writes one fleet.artifact.v2
+# record per dataset; the sweep reads those records read-only and deletes a
+# local original ONLY after the record's archive part confirms the upload
+# (drive_confirmed) and the manifest row for that exact relative path shows
+# the same bytes and the same sha256 as the file on disk, hashed at delete
+# time. hosts.toml [artifacts] local_delete_at selects the hatch:
+# "drive_confirmed" (default/absent) or "uploaded" (an eligible non-evidence,
+# non-mirror_required manifest row already reads uploaded; desk sets this
+# only under disk pressure with operator approval). Any other value refuses
+# the whole sweep. The sweep never uploads, copies or evicts anything,
+# never touches the Drive folder or the DriveFS directory, and never
+# deletes a directory unless it is empty after its files are deleted.
+artifacts_sweep_help() {
+  cat <<'EOF'
+Usage: wrk artifacts sweep [--job JOB] [--age AGE] [--policy FILE] [--apply]
+
+The artifact-store host sweep (design hk:doc designs/b953/artifact-store,
+revision 5). It deletes local original files whose dataset's
+fleet.artifact.v2 hk record confirms they already live in Drive, and never
+uploads, copies, moves or evicts anything. Dry-run by default; --apply
+deletes and records local_deleted rows in the same hk record.
+
+A file is deleted only when every check passes:
+  - its job is ended (a terminal job.completed/dropped/killed record), its
+    task is merged or dropped, and no live sentinel or pane remains;
+  - the job's dataset record was written by the mover (hk 2097) or by a
+    desk-interim upload and names this host;
+  - the file's policy class is evidence, final-build or another class the
+    policy file marks upload=1 — never record-text, protected, cache or
+    intermediate-build (cache and intermediates are hk 2090's prune);
+  - the manifest has a row for the file's path relative to the dataset
+    root, and the file's bytes and sha256 computed at delete time match
+    that row exactly.
+
+hosts.toml [artifacts] local_delete_at on this host picks the hatch:
+  drive_confirmed  (default, and when the key is absent) — delete only after
+                   the dataset archive part is fully drive_confirmed;
+  uploaded         — the mover's first confirmed read is enough for one
+                   file, but ONLY for non-evidence rows that are not
+                   mirror_required; evidence and mirror_required always
+                   wait for drive_confirmed. Any other value refuses the
+                   whole sweep and deletes nothing.
+
+Every kept or skipped file is printed with its reason; a file not in the
+manifest, or one that differs from it, stays. Directories are removed only
+when empty after their files were deleted. The sweep never touches the
+Drive folder or the DriveFS directory and never reads credentials.
+
+options:
+  --job JOB    restrict the sweep to one job
+  --age AGE    require the job's end to be at least this old (default 3d)
+  --policy FILE  artifact policy file (default: director/artifact_policy.json
+                 beside wrk, or director/artifact-policy.json)
+  --work-root DIR  base for the policy's relative named roots (default: the
+                 parent of the jobs inbox's parent)
+  --apply      delete and write local_deleted rows; default is a dry run
+EOF
+}
+
+# Resolve the artifact policy file and validate it. Prints TSV rows
+# (class, root-name, absolute-root, glob, upload-flag) for artifacts_sweep_job
+# plus resolves the work root via WRK_ARTIFACTS_WORK_ROOT / --work-root.
+artifacts_policy_file() {
+  local override="${1:-}"
+  if [[ -n "$override" ]]; then
+    [[ -f "$override" ]] || die "artifacts sweep: policy file not found: $override"
+    printf '%s\n' "$override"; return 0
+  fi
+  local d="${BASH_SOURCE[0]%/*}/../director"
+  if [[ -f "$d/artifact_policy.json" ]]; then
+    printf '%s\n' "$d/artifact_policy.json"; return 0
+  fi
+  if [[ -f "$d/artifact-policy.json" ]]; then
+    printf '%s\n' "$d/artifact-policy.json"; return 0
+  fi
+  return 1
+}
+
+# artifacts_policy_load FILE WORK_ROOT HOST_IDS → TSV rows on stdout; rc 2
+# prints an error line on stderr. Reads both policy shapes: hk 2090's bare
+# string roots and hk 2093's name -> {path, kind}. A row with a host applies
+# only on that host; a row with a job applies only to that job dir. Same
+# glob/first-wins rules as artifacts_sweep_job.
+artifacts_policy_load() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, os, sys
+path, work_root = sys.argv[1], os.path.realpath(sys.argv[2])
+host_ids = {h for h in sys.argv[3].split("|") if h}
+try:
+    pol = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError) as e:
+    sys.stderr.write("artifacts sweep: cannot read policy %s: %s\n" % (path, e))
+    sys.exit(2)
+raw_roots = pol.get("roots") or {}
+roots = {}
+for name, val in raw_roots.items():
+    if isinstance(val, dict):
+        rpath, kind = val.get("path"), val.get("kind") or "per-job"
+    else:
+        rpath, kind = val, "per-job"
+    if not isinstance(rpath, str) or not rpath:
+        sys.stderr.write("artifacts sweep: policy root %r has no path\n" % name)
+        sys.exit(2)
+    if kind not in ("per-job", "flat"):
+        sys.stderr.write("artifacts sweep: policy root %r has unknown kind %r\n"
+                         % (name, kind))
+        sys.exit(2)
+    roots[name] = (rpath, kind)
+rows = pol.get("rows") or []
+out = []
+for i, row in enumerate(rows):
+    cls = row.get("class")
+    pat = row.get("glob")
+    rname = row.get("root")
+    if not cls or not pat or not rname:
+        sys.stderr.write("artifacts sweep: policy row %d needs class+root+glob\n" % i)
+        sys.exit(2)
+    if rname not in roots:
+        sys.stderr.write("artifacts sweep: policy row %d names unknown root %r\n"
+                         % (i, rname))
+        sys.exit(2)
+    rpath, kind = roots[rname]
+    rjob = row.get("job") or ""
+    if rjob and kind != "per-job":
+        sys.stderr.write("artifacts sweep: policy row %d has a job on a flat root\n" % i)
+        sys.exit(2)
+    row_host = row.get("host") or ""
+    if row_host and row_host not in host_ids:
+        continue
+    abs_root = rpath if os.path.isabs(rpath) else os.path.join(work_root, rpath)
+    upload = "1" if row.get("upload") else "0"
+    mirror = "1" if row.get("mirror_required") else "0"
+    out.append("\t".join([cls, rname, os.path.realpath(abs_root), kind, pat,
+                          upload, rjob, mirror]))
+print("\n".join(out))
+PY
+}
+
+# Host ids this host answers to: hosts.toml [local] machine_id first, then
+# [hub] machine_id, then the hostname. '|'-joined for argv.
+artifacts_host_ids() {
+  {
+    printf '%s\n' "$(spillover_value local machine_id 2>/dev/null)"
+    printf '%s\n' "$(spillover_value hub machine_id 2>/dev/null)"
+    hostname -f 2>/dev/null
+    hostname 2>/dev/null
+  } | awk 'NF { sub(/\..*/, ""); print }' | sort -u | paste -sd'|' -
+}
+
+# Newest task_id named by the job's claim/reclaim events; empty on none.
+# "Newest" is event time, not file name: a claim can be written at a higher
+# file number with an older timestamp. seq then the name break ties.
+artifacts_job_task_id() {
+  local job="$1" jr
+  jr="$(wrk_jobs_root)" || return 0
+  [[ -d "$jr/$job" ]] || return 0
+  wrk_py - "$jr" "$job" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+jobs_root, job = sys.argv[1], sys.argv[2]
+d = os.path.join(jobs_root, job, "events")
+best = ""
+if os.path.isdir(d):
+    # Shared ordering: event time when dated, file mtime when not, so a
+    # newer undated claim still beats an older dated one.
+    for _name, doc, _mtime in wrk_events_ordered(d):
+        if not isinstance(doc, dict):
+            continue
+        kind = str(doc.get("kind", ""))
+        if "claim" not in kind and "reclaim" not in kind:
+            continue
+        pl = doc.get("payload") if isinstance(doc.get("payload"), dict) else {}
+        tid = pl.get("task_id") or doc.get("task_id")
+        if isinstance(tid, int) and tid > 0:
+            best = str(tid)
+        elif isinstance(tid, str) and tid.isdigit():
+            best = tid
+print(best)
+PY
+}
+
+# artifacts_task_lookup JOB HK → "task_id<TAB>state<TAB>project"; rc 1 when
+# the task cannot be read. hk is only ever read here.
+artifacts_task_lookup() {
+  local job="$1" hk="$2" task_id show
+  task_id="$(artifacts_job_task_id "$job")"
+  [[ -n "$task_id" ]] || return 1
+  show="$(run_bounded 10 "$hk" tasks show "$task_id" 2>/dev/null)" || return 1
+  [[ -n "$show" && "$show" != not_found ]] || return 1
+  printf '%s' "$show" | python3 -c '
+import json, sys
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(1)
+task = doc.get("task") if isinstance(doc.get("task"), dict) else doc
+state = task.get("state") or ""
+project = task.get("project") or ""
+if not project:
+    refs = task.get("refs") or {}
+    project = refs.get("project") or ""
+print("%s\t%s\t%s" % (sys.argv[1], state, project))
+' "$task_id"
+}
+
+# The per-job sweep: reads the fetched records JSONL and the policy TSV,
+# prints report lines, and writes plan files into plan_dir for the caller to
+# act on (doc put first, then unlink, then rmdir the emptied dirs).
+artifacts_sweep_job() {
+  wrk_py - "$@" <<'PY'
+import datetime, hashlib, json, os, re, sys
+
+job, jobdir, work_root, docs_path, plan_dir, ldel = sys.argv[1:7]
+host_ids = set(sys.argv[7].split("|")) if sys.argv[7] else set()
+policy_path, project, task_id = sys.argv[8:11]
+os.makedirs(plan_dir, exist_ok=True)
+jobs_root_real = os.path.realpath(os.path.dirname(jobdir))
+selected_real = os.path.realpath(jobdir)
+
+NEVER = {"record-text", "protected", "cache", "intermediate-build", "worktree"}
+UPLOAD = {"evidence", "final-build"}
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def line(*parts):
+    print("artifact-sweep job=%s %s" % (job, " ".join(parts)))
+
+
+def glob_re(pat):
+    i, out, n = 0, "", len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "*":
+            if i + 1 < n and pat[i + 1] == "*":
+                j = i + 2
+                while j < n and pat[j] == "*":
+                    j += 1
+                if j < n and pat[j] == "/":
+                    out += "(?:[^/]+/)*"
+                    i = j + 1
+                else:
+                    out += ".*"
+                    i = j
+            else:
+                out += "[^/]*"
+                i += 1
+        elif c == "?":
+            out += "[^/]"
+            i += 1
+        elif c == "[":
+            j = pat.find("]", i + 1)
+            if j == -1:
+                out += re.escape(c)
+                i += 1
+            else:
+                inner = pat[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out += "[" + inner + "]"
+                i = j + 1
+        else:
+            out += re.escape(c)
+            i += 1
+    return re.compile(out + r"\Z")
+
+
+rows = []
+roots = {}
+for ln in open(policy_path, encoding="utf-8"):
+    ln = ln.rstrip("\n")
+    if not ln:
+        continue
+    cls, rname, abs_root, kind, pat, upload, rjob, mirror = ln.split("\t")
+    rows.append((cls, rname, abs_root, glob_re(pat), upload == "1", rjob,
+                 mirror == "1"))
+    roots[rname] = (abs_root, kind)
+upload_classes = UPLOAD | {r[0] for r in rows if r[4]}
+# Deepest root first when nested.
+root_order = sorted(roots.items(), key=lambda kv: -len(kv[1][0]))
+
+
+def class_of(rel, root_name):
+    parts = rel.split("/")
+    cands = ["/".join(parts[:k]) for k in range(len(parts), 0, -1)]
+    for cls, rname, _abs, rx, _u, rjob, mirror in rows:
+        if rname != root_name:
+            continue
+        if rjob and rjob != job:
+            continue
+        if any(rx.match(c) for c in cands):
+            return cls, mirror
+    return None, False
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def row_uploaded(row):
+    st = str(row.get("state") or "")
+    if st in ("uploaded", "evicted", "drive_confirmed"):
+        return True
+    return bool(row.get("uploaded_at"))
+
+
+docs = []
+for ln in open(docs_path, encoding="utf-8"):
+    ln = ln.strip()
+    if ln:
+        docs.append(json.loads(ln))
+
+plan_idx = 0
+for d in docs:
+    key = str(d.get("key") or "")
+    kind = str(d.get("kind") or "note")
+    if d.get("_error"):
+        line("dataset=%s skip reason=record-fetch-failed" % key)
+        continue
+    try:
+        rec = json.loads(d.get("body") or "")
+    except (TypeError, ValueError, RecursionError):
+        line("dataset=%s skip reason=bad-record" % key)
+        continue
+    if not isinstance(rec, dict) or rec.get("schema") != "fleet.artifact.v2":
+        line("dataset=%s skip reason=bad-record" % key)
+        continue
+    pref = "artifacts/%s/%s/%s" % (project, task_id, job)
+    if not (key == pref or key.startswith(pref + "/")):
+        line("dataset=%s skip reason=key-mismatch" % key)
+        continue
+    bj = rec.get("job_id")
+    if isinstance(bj, str) and bj and bj != job:
+        line("dataset=%s skip reason=job-mismatch" % key)
+        continue
+    bt = rec.get("task_id")
+    if bt is not None and str(bt) != str(task_id):
+        line("dataset=%s skip reason=task-mismatch" % key)
+        continue
+    host = rec.get("host")
+    if not isinstance(host, str) or not host or not host_ids or host not in host_ids:
+        line("dataset=%s skip reason=host-mismatch" % key)
+        continue
+    archive = rec.get("archive")
+    if not isinstance(archive, dict):
+        archive = {}
+    source = archive.get("source") or archive.get("source_path") or rec.get("source")
+    if not isinstance(source, str) or not source.startswith("/"):
+        line("dataset=%s skip reason=source-unset" % key)
+        continue
+    real_source = os.path.realpath(source)
+    if not os.path.exists(real_source):
+        line("dataset=%s skip reason=source-missing" % key)
+        continue
+    if not os.path.isdir(real_source):
+        line("dataset=%s skip reason=source-not-dir" % key)
+        continue
+    base = None
+    matched_jobs_root = False
+    for rname, (rroot, rkind) in root_order:
+        rr = os.path.realpath(rroot)
+        if real_source == rr or real_source.startswith(rr + os.sep):
+            matched_jobs_root = rr == jobs_root_real
+            if rkind == "flat":
+                base = rr
+                base_root_name = rname
+                break
+            rest = real_source[len(rr):].lstrip(os.sep)
+            first = rest.split(os.sep)[0] if rest else ""
+            if not first:
+                base = None
+                break
+            base = os.path.join(rr, first)
+            base_root_name = rname
+            break
+    if base is None:
+        line("dataset=%s skip reason=source-outside-roots" % key)
+        continue
+    # The selected job's gates only cover this job. A record under this job's
+    # key must not point its source at a sibling job dir under the jobs inbox,
+    # or it could delete a live job's files. Other named roots keep today's
+    # behaviour.
+    if matched_jobs_root and os.path.realpath(base) != selected_real:
+        line("dataset=%s skip reason=source-other-job" % key)
+        continue
+    contents = {}
+    for r in archive.get("contents") or []:
+        if isinstance(r, dict) and isinstance(r.get("path"), str):
+            p = r["path"].replace("\\", "/")
+            if p.startswith("/") or p.startswith("../") or "/../" in p or p == "..":
+                continue
+            contents[p] = r
+    confirmed = archive.get("state") == "drive_confirmed" or \
+        bool(archive.get("drive_confirmed_at"))
+    mirror_ds = bool(archive.get("mirror_required"))
+    local_deleted = rec.get("local_deleted")
+    if not isinstance(local_deleted, list):
+        local_deleted = []
+    done = set()
+    for r in local_deleted:
+        if isinstance(r, dict):
+            done.add((r.get("path"), r.get("sha256")))
+
+    plan = []
+    dirs = set()
+    skipped = {}
+    for root, subdirs, files in os.walk(real_source):
+        subdirs[:] = [sd for sd in subdirs
+                      if not os.path.islink(os.path.join(root, sd))]
+        for name in sorted(files):
+            f = os.path.join(root, name)
+            if os.path.islink(f):
+                skipped["symlink"] = skipped.get("symlink", 0) + 1
+                continue
+            rel = os.path.relpath(f, real_source).replace(os.sep, "/")
+            crel = os.path.relpath(f, base).replace(os.sep, "/")
+            if crel.split("/")[0] in ("events", "refs"):
+                skipped["guarded"] = skipped.get("guarded", 0) + 1
+                continue
+            cls, mirror_pol = class_of(crel, base_root_name)
+            if cls == "protected":
+                line("dataset=%s path=%s class=%s kept reason=protected-class"
+                     % (key, rel, cls))
+                continue
+            if cls is None or cls in NEVER or cls not in upload_classes:
+                skipped[cls or "none"] = skipped.get(cls or "none", 0) + 1
+                continue
+            try:
+                size = os.lstat(f).st_size
+            except OSError:
+                line("dataset=%s path=%s class=%s kept reason=unreadable"
+                     % (key, rel, cls))
+                continue
+            row = contents.get(rel)
+            if row is None:
+                line("dataset=%s path=%s class=%s kept reason=not-in-manifest"
+                     % (key, rel, cls))
+                continue
+            rbytes = row.get("bytes", row.get("size"))
+            if rbytes != size:
+                line("dataset=%s path=%s class=%s kept reason=bytes-differs"
+                     % (key, rel, cls))
+                continue
+            rsha = row.get("sha256")
+            if not isinstance(rsha, str) or not SHA_RE.match(rsha):
+                line("dataset=%s path=%s class=%s kept reason=manifest-no-sha256"
+                     % (key, rel, cls))
+                continue
+            try:
+                h = sha256_of(f)
+            except OSError:
+                line("dataset=%s path=%s class=%s kept reason=hash-failed"
+                     % (key, rel, cls))
+                continue
+            if h != rsha:
+                line("dataset=%s path=%s class=%s kept reason=hash-differs"
+                     % (key, rel, cls))
+                continue
+            allowed = confirmed
+            if not allowed and ldel == "uploaded" and cls != "evidence" \
+                    and not mirror_pol and not row.get("mirror_required") \
+                    and not mirror_ds and row_uploaded(row):
+                allowed = True
+            if not allowed:
+                line("dataset=%s path=%s class=%s kept reason=not-confirmed"
+                     % (key, rel, cls))
+                continue
+            recorded = (rel, rsha) in done
+            plan.append({"abs": f, "rel": rel, "cls": cls, "bytes": size,
+                         "sha": rsha, "recorded": recorded})
+            drel = os.path.dirname(rel)
+            while drel:
+                dirs.add(drel)
+                drel = os.path.dirname(drel)
+
+    for scls in sorted(skipped):
+        line("dataset=%s skipped class=%s files=%d" % (key, scls, skipped[scls]))
+
+    plan_idx += 1
+    idx = plan_idx
+    new_rows = [p for p in plan if not p["recorded"]]
+    if new_rows:
+        body = dict(rec)
+        now = datetime.datetime.now(datetime.timezone.utc) \
+            .replace(microsecond=0).isoformat()
+        body["local_deleted"] = local_deleted + [
+            {"path": p["rel"], "bytes": p["bytes"], "sha256": p["sha"],
+             "local_deleted_at": now} for p in new_rows]
+        with open(os.path.join(plan_dir, "rec-%d.json" % idx), "w",
+                  encoding="utf-8") as f:
+            json.dump(body, f)
+    with open(os.path.join(plan_dir, "meta-%d" % idx), "w",
+              encoding="utf-8") as f:
+        f.write("%s\t%s\t%s\t%s\n" % (key, kind, real_source,
+                                    "rec-%d.json" % idx if new_rows else "-"))
+    with open(os.path.join(plan_dir, "plan-%d.tsv" % idx), "w",
+              encoding="utf-8") as f:
+        for p in plan:
+            f.write("\t".join([p["abs"], p["rel"], p["cls"], str(p["bytes"]),
+                               p["sha"]]) + "\n")
+    with open(os.path.join(plan_dir, "dirs-%d" % idx), "w",
+              encoding="utf-8") as f:
+        for drel in sorted(dirs, key=lambda s: -s.count("/")):
+            f.write(drel + "\n")
+    line("dataset=%s files=%d planned=%d" % (key, len(plan) + sum(skipped.values()),
+                                           len(plan)))
+PY
+}
+
+artifacts_sweep_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { artifacts_sweep_help; return 0; }
+  local job_filter="" age="3d" policy_override="" apply=0 work_root_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) artifacts_sweep_help; return 0 ;;
+      --job) job_filter="${2:-}"; [[ -n "$job_filter" ]] || die "--job requires a value"; shift 2 ;;
+      --job=*) job_filter="${1#*=}"; shift ;;
+      --age) age="${2:-}"; [[ -n "$age" ]] || die "--age requires a value"; shift 2 ;;
+      --age=*) age="${1#*=}"; shift ;;
+      --policy) policy_override="${2:-}"; [[ -n "$policy_override" ]] || die "--policy requires a value"; shift 2 ;;
+      --policy=*) policy_override="${1#*=}"; shift ;;
+      --work-root) work_root_arg="${2:-}"; [[ -n "$work_root_arg" ]] || die "--work-root requires a value"; shift 2 ;;
+      --work-root=*) work_root_arg="${1#*=}"; shift ;;
+      --apply) apply=1; shift ;;
+      -*) die "artifacts sweep: unknown option '$1'" ;;
+      *) die "artifacts sweep: unexpected argument '$1'" ;;
+    esac
+  done
+  local mode="dry-run"; (( apply )) && mode="apply"
+  local age_s
+  age_s="$(parse_duration_s "$age")" || die "artifacts sweep: invalid --age '$age' (use 86400, 24h or 3d)"
+  local jobs_root
+  jobs_root="$(wrk_jobs_root)" || return 0
+  local work_root
+  if [[ -n "$work_root_arg" ]]; then
+    work_root="$(cd "$work_root_arg" 2>/dev/null && pwd)" || die "artifacts sweep: bad --work-root '$work_root_arg'"
+  else
+    work_root="$(dirname "$(dirname "$jobs_root")")"
+  fi
+  local policy_file
+  policy_file="$(artifacts_policy_file "$policy_override")" ||
+    die "artifacts sweep: no artifact policy file (director/artifact_policy.json or --policy)"
+  local ldel
+  ldel="$(spillover_value artifacts local_delete_at 2>/dev/null || true)"
+  ldel="${ldel:-drive_confirmed}"
+  case "$ldel" in
+    drive_confirmed|uploaded) ;;
+    *) die "artifacts sweep: hosts.toml [artifacts] local_delete_at='$ldel' is not 'drive_confirmed' or 'uploaded'; refusing to touch any artifact" ;;
+  esac
+  local hk
+  hk="$(hk_bin)"
+  [[ -n "$hk" ]] || die "artifacts sweep: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
+  local host_ids
+  host_ids="$(artifacts_host_ids)"
+  local policy_tsv
+  policy_tsv="$(artifacts_policy_load "$policy_file" "$work_root" "$host_ids")" ||
+    die "artifacts sweep: policy $policy_file failed validation"
+
+  local plan_root
+  plan_root="$(mktemp -d "${TMPDIR:-/tmp}/wrk-artifacts-sweep.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$plan_root'" RETURN
+  local policy_tsv_file="$plan_root/policy.tsv"
+  printf '%s\n' "$policy_tsv" >"$policy_tsv_file"
+
+  local jobs_n=0
+  SWEEP_DELETED_FILES=0 SWEEP_DELETED_BYTES=0
+  local job jobdir entry task_info task_id state project keys key
+  local jobs_list=()
+  if [[ -n "$job_filter" ]]; then
+    jobs_list+=("$job_filter")
+  else
+    for entry in "$jobs_root"/*/; do
+      [[ -d "$entry" ]] || continue
+      [[ -L "${entry%/}" ]] && continue
+      jobs_list+=("$(basename "$entry")")
+    done
+  fi
+  for job in "${jobs_list[@]+"${jobs_list[@]}"}"; do
+    [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+      echo "artifact-sweep job=$job skip reason=bad-job-name"; continue; }
+    jobdir="$jobs_root/$job"
+    [[ -d "$jobdir" ]] || { echo "artifact-sweep job=$job skip reason=no-job-dir"; continue; }
+    # The same ended/pane evidence as wrk prune: one event-stream scan, then
+    # a herdr probe only for jobs that recorded a pane.
+    local scan ended jage pane
+    scan="$(job_events_scan "$jobdir/events" 2>/dev/null || true)"
+    ended=""; pane="-"; jage=""
+    IFS=$'\t' read -r _ ended _ _ jage _ _ _ _ pane _ <<<"$scan"
+    if [[ "$ended" != 1 ]]; then
+      echo "artifact-sweep job=$job skip reason=not-ended"; continue
+    fi
+    if [[ -n "$pane" && "$pane" != - ]]; then
+      local probe pclass ptoken
+      probe="$(herdr_agent_probe "$pane")"
+      IFS=$'\t' read -r pclass ptoken _ <<<"$probe"
+      case "$pclass" in
+        gone) ;;
+        ok) echo "artifact-sweep job=$job skip reason=pane-alive"; continue ;;
+        *) echo "artifact-sweep job=$job skip reason=pane-unverified"; continue ;;
+      esac
+    fi
+    if job_has_live_completion_sentinel "$job"; then
+      echo "artifact-sweep job=$job skip reason=live-sentinel"; continue
+    fi
+    if [[ "$jage" =~ ^[0-9]+$ && "$jage" -lt "$age_s" ]]; then
+      echo "artifact-sweep job=$job skip reason=inside-age"; continue
+    fi
+    task_info="$(artifacts_task_lookup "$job" "$hk")" || {
+      echo "artifact-sweep job=$job skip reason=task-unreadable"; continue; }
+    task_id="${task_info%%	*}"; task_info="${task_info#*	}"
+    state="${task_info%%	*}"; project="${task_info#*	}"
+    case "$state" in
+      merged|dropped) ;;
+      "") echo "artifact-sweep job=$job skip reason=task-unknown"; continue ;;
+      *) echo "artifact-sweep job=$job skip reason=task-$state"; continue ;;
+    esac
+    [[ -n "$project" ]] || { echo "artifact-sweep job=$job skip reason=no-project"; continue; }
+    jobs_n=$((jobs_n + 1))
+
+    local docs_jsonl="$plan_root/docs-$job.jsonl" list_out
+    : >"$docs_jsonl"
+    list_out="$(run_bounded 10 "$hk" doc list --prefix "artifacts/$project/$task_id/" 2>/dev/null)" || {
+      echo "artifact-sweep job=$job skip reason=record-fetch-failed"; continue; }
+    # hk1860: record bodies can outgrow a single argv word (128KiB on
+    # Linux) — the fetched JSON always travels on stdin here.
+    keys="$(printf '%s' "$list_out" | python3 -c '
+import json, sys
+try:
+    docs = json.loads(sys.stdin.read())
+except ValueError:
+    docs = []
+pref = "artifacts/%s/%s/%s" % (sys.argv[1], sys.argv[2], sys.argv[3])
+seen = set()
+out = []
+for d in docs if isinstance(docs, list) else []:
+    k = d.get("key") if isinstance(d, dict) else None
+    if isinstance(k, str) and (k == pref or k.startswith(pref + "/")) \
+            and k not in seen:
+        seen.add(k)
+        out.append(k)
+print("\n".join(sorted(out)[:64]))
+' "$project" "$task_id" "$job")"
+    if [[ -z "$keys" ]]; then
+      echo "artifact-sweep job=$job skip reason=no-record"; continue
+    fi
+    local get_out get_rc
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      get_rc=0
+      get_out="$(run_bounded 10 "$hk" doc get "$key" 2>/dev/null)" || get_rc=$?
+      if [[ "$get_rc" != 0 || -z "$get_out" ]]; then
+        printf '{"key":%s,"kind":"note","body":"","_error":true}\n' \
+          "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$key")" \
+          >>"$docs_jsonl"
+      else
+        printf '%s' "$get_out" | python3 -c '
+import json, sys
+key = sys.argv[1]
+try:
+    doc = json.loads(sys.stdin.read())
+except (ValueError, RecursionError):
+    doc = None
+if not isinstance(doc, dict) or not isinstance(doc.get("body"), str) \
+        or not doc.get("body"):
+    print(json.dumps({"key": key, "kind": "note", "body": "", "_error": True}))
+    raise SystemExit(0)
+print(json.dumps({"key": doc.get("key") or "", "kind": doc.get("kind") or "note",
+                  "body": doc.get("body") or ""}))
+' "$key" >>"$docs_jsonl"
+      fi
+    done <<<"$keys"
+
+    local plan_dir="$plan_root/plan-$job"
+    artifacts_sweep_job "$job" "$jobdir" "$work_root" "$docs_jsonl" \
+      "$plan_dir" "$ldel" "$host_ids" "$policy_tsv_file" "$project" "$task_id"
+    artifacts_sweep_apply_plan "$job" "$plan_dir" "$apply" "$hk"
+  done
+  echo "artifact-sweep done jobs=$jobs_n mode=$mode deleted_files=$SWEEP_DELETED_FILES deleted_bytes=$SWEEP_DELETED_BYTES"
+}
+
+# artifacts_row_matches ABS BYTES SHA — 0 only when the path is still a
+# regular file of that size whose sha256 is SHA. Used at delete time: the
+# plan-time hash is not enough, because a file can change while the record
+# is being written.
+artifacts_row_matches() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import hashlib, os, stat, sys
+path, size, want = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    st = os.lstat(path)
+    size = int(size)
+except (OSError, ValueError):
+    sys.exit(1)
+if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+    sys.exit(1)
+h = hashlib.sha256()
+try:
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+except OSError:
+    sys.exit(1)
+sys.exit(0 if h.hexdigest() == want else 1)
+PY
+}
+
+# artifacts_record_filter BODY_IN BODY_OUT KEPT_TSV — drop from local_deleted
+# every (path, sha256) that KEPT_TSV lists, so a file kept at delete time is
+# not recorded as deleted.
+artifacts_record_filter() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+src, dst, kept = sys.argv[1:4]
+try:
+    with open(src, encoding="utf-8") as f:
+        rec = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+drop = set()
+try:
+    with open(kept, encoding="utf-8") as f:
+        for ln in f:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) >= 5:
+                drop.add((parts[1], parts[4]))
+except OSError:
+    sys.exit(1)
+rec["local_deleted"] = [
+    r for r in rec.get("local_deleted") or []
+    if not (isinstance(r, dict) and (r.get("path"), r.get("sha256")) in drop)]
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(rec, f)
+PY
+}
+
+# Act on one job's plan dir: re-verify, doc put the updated record, unlink
+# each file only after a fresh size+sha256 check, then rmdir the emptied
+# dirs. A file that changed after the plan is kept, and any row already put
+# for it is removed with a corrective record. Prints action= lines.
+artifacts_sweep_apply_plan() {
+  local job="$1" plan_dir="$2" apply="$3" hk="$4"
+  [[ -d "$plan_dir" ]] || return 0
+  local meta idx key kind src recf put_rc put_bad=" "
+  for meta in "$plan_dir"/meta-*; do
+    [[ -f "$meta" ]] || continue
+    idx="${meta##*/meta-}"
+    IFS=$'\t' read -r key kind src recf <"$meta"
+    local plan_file="$plan_dir/plan-$idx.tsv"
+    local verified="$plan_dir/verified-$idx.tsv"
+    local kept0="$plan_dir/kept-$idx.tsv" keptf="$plan_dir/kept-final-$idx.tsv"
+    : >"$verified"; : >"$kept0"; : >"$keptf"
+    local abs rel cls bytes sha
+    # First re-verify immediately before the record write, so a file already
+    # changed since plan time never enters local_deleted.
+    while IFS=$'\t' read -r abs rel cls bytes sha; do
+      [[ -n "$abs" ]] || continue
+      if artifacts_row_matches "$abs" "$bytes" "$sha"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$verified"
+      else
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$kept0"
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=changed-before-delete"
+      fi
+    done <"$plan_file"
+    local body="$plan_dir/$recf"
+    if [[ "$recf" != "-" && -s "$kept0" ]]; then
+      if artifacts_record_filter "$body" "$plan_dir/$recf.filtered" "$kept0"; then
+        body="$plan_dir/$recf.filtered"
+      fi
+    fi
+    if [[ "$recf" != "-" && "$apply" == 1 ]]; then
+      put_rc=0
+      run_bounded 10 "$hk" doc put --key "$key" --kind "$kind" --job "$job" \
+        --file "$body" >/dev/null 2>&1 || put_rc=$?
+      [[ "$put_rc" == 0 ]] || put_bad+="$idx "
+    fi
+    local corrected=0
+    while IFS=$'\t' read -r abs rel cls bytes sha; do
+      [[ -n "$abs" ]] || continue
+      if [[ "$apply" != 1 ]]; then
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls bytes=$bytes action=would-delete"
+        continue
+      fi
+      if [[ "$put_bad" == *" $idx "* ]]; then
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=record-write-failed"
+        continue
+      fi
+      # The delete-time check: a file changed during the record write is
+      # kept, and the row is removed from the record below.
+      if ! artifacts_row_matches "$abs" "$bytes" "$sha"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$keptf"
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=changed-before-delete"
+        corrected=1
+        continue
+      fi
+      if rm -f "$abs" 2>/dev/null; then
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls bytes=$bytes action=deleted"
+        SWEEP_DELETED_FILES=$(( SWEEP_DELETED_FILES + 1 ))
+        SWEEP_DELETED_BYTES=$(( SWEEP_DELETED_BYTES + bytes ))
+      else
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=delete-failed"
+      fi
+    done <"$verified"
+    if [[ "$apply" == 1 && "$corrected" == 1 && "$recf" != "-" &&
+          "$put_bad" != *" $idx "* ]]; then
+      if artifacts_record_filter "$body" "$plan_dir/$recf.corrected" "$keptf"; then
+        put_rc=0
+        run_bounded 10 "$hk" doc put --key "$key" --kind "$kind" --job "$job" \
+          --file "$plan_dir/$recf.corrected" >/dev/null 2>&1 || put_rc=$?
+        [[ "$put_rc" == 0 ]] ||
+          echo "artifact-sweep job=$job dataset=$key kept reason=record-correct-failed"
+      else
+        echo "artifact-sweep job=$job dataset=$key kept reason=record-correct-failed"
+      fi
+    fi
+    if [[ "$apply" == 1 && "$put_bad" != *" $idx "* && -f "$plan_dir/dirs-$idx" ]]; then
+      local drel
+      while IFS= read -r drel; do
+        [[ -n "$drel" && "$drel" != "." ]] || continue
+        [[ "$drel" == /* || "$drel" == ..* ]] && continue
+        if rmdir "$src/$drel" 2>/dev/null; then
+          echo "artifact-sweep job=$job dataset=$key dir=$drel action=rmdir"
+        fi
+      done <"$plan_dir/dirs-$idx"
+    fi
+  done
 }
 
 find_cmd() {
