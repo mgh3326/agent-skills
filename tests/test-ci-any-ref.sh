@@ -39,16 +39,32 @@ def validate(wf_text: str, ci_text: str) -> None:
     assert perm_keys == {"contents": "read", "statuses": "write"}, \
         f"workflow permissions must be exactly contents:read + statuses:write, got {perm_keys}"
 
-    def job_perm_blocks(text: str) -> list[dict]:
-        blocks = []
-        for match in re.finditer(r"(?m)^    permissions:\n((?:      .*\n)+)", text):
-            blocks.append(dict(re.findall(r"(?m)^      (\w[\w-]*): (\w+)", match.group(1))))
-        return blocks
+    def perm_decls(text: str) -> list[tuple[int, str, dict]]:
+        """All `permissions:` declarations: (indent, form, {scope: level})."""
+        decls = []
+        for match in re.finditer(r"(?m)^([ \t]*)permissions: *([^#\n]*)$", text):
+            indent, tail = len(match.group(1)), match.group(2).strip()
+            if tail.startswith("{"):
+                inner = tail.strip("{} ")
+                decls.append((indent, "inline", dict(
+                    kv.split(":") for kv in
+                    (pair.strip() for pair in inner.split(",") if pair.strip()))))
+            elif tail:
+                decls.append((indent, "scalar", {tail.replace("-all", ""): "all"}))
+            else:
+                rest = text[match.end() + 1:]
+                body = re.match(rf"(?: {{{indent + 1},}}[^\n]*\n?)*", rest).group(0)
+                decls.append((indent, "block", dict(re.findall(
+                    rf"(?m)^ {{{indent + 2}}}(\w[\w-]*): (\w+)", body))))
+        return decls
+
+    LEVELS = {"none": 0, "read": 1, "write": 2, "all": 3, "write-all": 3, "read-all": 3}
 
     # Permission ceiling: the callee may only hold a subset of what the calling
     # job passes down, or the run fails validation at startup.
-    callee_top = dict(re.findall(r"(?m)^  (\w[\w-]*): (\w+)", top_block(ci_text, "permissions")))
-    callee_jobs = job_perm_blocks(ci_text)
+    callee_decls = perm_decls(ci_text)
+    callee_top = next(d for i, _f, d in callee_decls if i == 0)
+    callee_jobs = [d for i, _f, d in callee_decls if i > 0]
     ci_call = re.search(
         r"(?m)^  ci:\n(?:    .*\n|      .*\n|        .*\n)*?    uses: \./\.github/workflows/ci\.yml",
         wf_text,
@@ -58,14 +74,19 @@ def validate(wf_text: str, ci_text: str) -> None:
         r"(?m)^      (\w[\w-]*): (\w+)",
         re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", ci_call.group(0)).group(1),
     ))
-    for needed in [callee_top, *callee_jobs]:
-        assert needed.keys() <= caller_grants.keys(), \
-            f"callee declares {needed} but the calling job grants only {caller_grants}"
+    union_needed = {k: max(LEVELS[d[k]] for d in [callee_top, *callee_jobs]) for k in
+                    {k for d in [callee_top, *callee_jobs] for k in d}}
+    assert union_needed.keys() == caller_grants.keys(), \
+        f"calling job must grant exactly the callee's declared scopes: {caller_grants} vs {union_needed}"
+    for scope, need in union_needed.items():
+        assert LEVELS[caller_grants[scope]] >= need, f"grant level too low for {scope}"
 
-    # Refusal: a failed resolve must skip the status job.
+    # Refusal: a failed resolve must skip ci and the status job.
+    assert "needs: resolve" in ci_call.group(0)
     status_if = re.search(r"(?ms)^  status:.*?^    if: (.*)$", wf_text)
     assert status_if and "needs.resolve.result == 'success'" in status_if.group(1), \
         "status job must be gated on resolve success"
+    assert "needs: [resolve, ci]" in wf_text
 
     conc = top_block(wf_text, "concurrency")
     assert "inputs.ref" in conc, "concurrency group must key on the target ref"
@@ -81,20 +102,33 @@ def validate(wf_text: str, ci_text: str) -> None:
     assert "statuses/${TARGET_SHA}" in wf_text, "status must post to statuses/<target sha>"
     assert "TARGET_SHA: ${{ needs.resolve.outputs.sha }}" in wf_text
     status_section = wf_text.split("status:", 1)[1]
-    assert "github.sha" not in status_section and "github.event" not in status_section, \
+    assert 'context="ci-ok"' in status_section, "status context must be ci-ok"
+    assert "target_url" in status_section, "status must carry the run URL"
+    assert "GITHUB_SHA" not in status_section and "github.sha" not in status_section \
+        and "github.event" not in status_section, \
         "status job must not derive its target from github.sha"
 
+    # ref must reach the runner via env, never expanded into shell text.
+    assert "INPUT_REF: ${{ inputs.ref }}" in wf_text
+    assert 'resolve-ci-ref "$INPUT_REF"' in wf_text
+    assert 'resolve-ci-ref "${{ inputs.ref }}"' not in wf_text, \
+        "inputs.ref must not be expanded into the run script"
+
+    # empty-suite guard: an empty shard matrix fails the job, so skip it instead.
+    assert "needs.changes.outputs.shards != '[]'" in ci_text, \
+        "ubuntu must be skipped when the suite selects no shards"
+
     # exact checkout: every checkout in ci.yml honors inputs.ref; no merge anywhere.
-    n_checkout = len(re.findall(r"uses: actions/checkout@v4", ci_text))
+    n_checkout = len(re.findall(r"uses: actions/checkout@v[\w.:-]+", ci_text))
     n_ref = len(re.findall(r"ref: \$\{\{ inputs\.ref \}\}", ci_text))
     assert n_checkout > 0 and n_checkout == n_ref, \
         f"every checkout must pin inputs.ref ({n_ref}/{n_checkout})"
-    assert "git merge" not in ci_text and "git pull" not in ci_text, \
-        "workflow must not merge main into the checkout"
+    for text in (ci_text, wf_text):
+        assert not re.search(r"\bgit (merge(?!-base)|pull|rebase|reset)\b", text), \
+            "workflow must not merge or move the checkout onto main"
     assert "workflow_call:" in ci_text
     assert "actions/checkout" not in wf_text.split("ci:", 1)[1].split("status:", 1)[0], \
         "the reusable call must not re-checkout"
-    assert "git merge" not in wf_text and "git pull" not in wf_text
 
 
 validate(wf, ci)
@@ -118,7 +152,7 @@ mutant_status = wf.replace(
     "TARGET_SHA: ${{ github.sha }}",
 )
 try:
-    validate(wf, mutant_status)
+    validate(mutant_status, ci)
 except AssertionError:
     pass
 else:

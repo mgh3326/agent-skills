@@ -40,8 +40,9 @@ jobs:
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
-          SHA="$(scripts/resolve-ci-ref "${{ inputs.ref }}" "$GITHUB_REPOSITORY")"
+          SHA="$(scripts/resolve-ci-ref "$INPUT_REF" "$GITHUB_REPOSITORY")"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
   ci:

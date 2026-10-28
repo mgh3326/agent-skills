@@ -239,7 +239,7 @@ jobs:
   ubuntu:
     name: ubuntu (${{ matrix.shard }})
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.shards != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
