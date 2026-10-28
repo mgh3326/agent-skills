@@ -99,7 +99,10 @@ spawn_argv() {
   local model="$1" terra_effort="" terra_arm="" terra_screen="$ROOT/tests/fixtures/codex-terra61-footer.txt"; shift
   case "$model" in
     codex-terra61) terra_effort=low; terra_arm=codex-terra61@low ;;
-    builder-terra61-*) terra_effort="${model##*-}"; terra_arm="codex-terra61@$terra_effort" ;;
+    builder-terra61-*) terra_effort="${model##*-}"; terra_arm="codex-terra61@$terra_effort"
+      # hk 2218: high/xhigh/max are placed canon rows and normal pinned
+      # spellings, so they spawn with no marker; only medium stays E6.
+      case "$terra_effort" in high|xhigh|max) terra_arm="" ;; esac ;;
   esac
   if [[ -n "$terra_effort" && "$terra_effort" != high ]]; then
     terra_screen="$TMP/terra61-$model-footer.txt"
@@ -154,11 +157,26 @@ echo "PASS Luna profiles (codex-luna, codex-luna-hi, codex-luna-max) run $CONTRA
 terra61_argv="$(spawn_argv codex-terra61)"
 grep -qF -- '-m gpt-6.1-terra -c model_reasoning_effort=low' <<<"$terra61_argv" ||
   fail "codex-terra61 must launch gpt-6.1-terra at default low: $terra61_argv"
-for terra61_rung in medium high xhigh max; do
+for terra61_rung in medium high max; do
   assert_argv_has "builder-terra61-$terra61_rung" \
     "-m gpt-6.1-terra -c model_reasoning_effort=$terra61_rung" \
     --role builder --lane guard-lane --parent guard-parent-lane
 done
+# codex-terra61@xhigh is the A+ escalation rung: unmarked, but gate-decided,
+# so the spawn carries an operator request (hk 2218).
+assert_argv_has builder-terra61-xhigh "-m gpt-6.1-terra -c model_reasoning_effort=xhigh" \
+  --role builder --lane guard-lane --parent guard-parent-lane --operator-request hk:task/2218
+# builder-terra61-medium has no canon row and still needs its exact marker.
+if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 SCOPEFUEL_E6_ARM= \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m builder-terra61-medium -p "$PROMPT" -w w -l fixture --t T1 \
+  --task "$("$HANDOFFKEEP_BIN" tasks add --title "contract task" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" \
+  --role builder --lane guard-lane --parent guard-parent-lane >"$TMP/terra-medium.out" 2>&1; then
+  fail "unmarked builder-terra61-medium must stay refused: $(cat "$TMP/terra-medium.out")"
+fi
+grep -q 'SCOPEFUEL_E6_ARM=codex-terra61@medium' "$TMP/terra-medium.out" ||
+  fail "builder-terra61-medium refusal must name its marker: $(cat "$TMP/terra-medium.out")"
 echo "PASS Terra61 base and pinned builder profiles launch gpt-6.1-terra at the selected effort"
 
 # Operator decision 2026-10-12 noterra still bars the old Terra spellings; the

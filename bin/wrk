@@ -111,7 +111,7 @@ ALL_PROFILES=(
 # decision r1026solmax, desk, on hk 1786) and builder-sol-xhigh is the S+
 # escalation row the gate still decides (hk 2043). This is the one place the
 # set is named.
-NORMAL_PINNED_BUILDERS=(builder-sol-xhigh builder-sol-max)
+NORMAL_PINNED_BUILDERS=(builder-sol-xhigh builder-sol-max builder-terra61-high builder-terra61-xhigh builder-terra61-max)
 normal_pinned_builder() {
   local pinned
   for pinned in "${NORMAL_PINNED_BUILDERS[@]}"; do
@@ -352,8 +352,10 @@ Options:
                      devin-argon-low are likewise worker/tester-only (hk 1620
                      phase 1) — --role builder refuses all three.
                      codex-terra61 runs GPT-6.1 Terra (default low; Codex
-                     0.164.0). builder-terra61-medium/high/xhigh/max pin
-                     that rung and require SCOPEFUEL_E6_ARM=codex-terra61@RUNG.
+                     0.164.0). builder-terra61-high/xhigh/max are normal
+                     pinned spellings (canon rows placed 2026-10-28, hk 2218);
+                     builder-terra61-medium still requires
+                     SCOPEFUEL_E6_ARM=codex-terra61@medium.
                      codex-terra, codex-terra-max, codex-med and
                      builder-terra-* remain refused: gpt-5.6-terra is barred
                      by operator 2026-10-12 noterra.
@@ -682,8 +684,8 @@ fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 Canonical codex profiles: codex-luna, codex-sol, codex-terra61.
 Existing codex aliases remain valid: codex, codex-luna-hi, codex-luna-max,
 codex-max. codex-terra61 runs gpt-6.1-terra (footer display GPT-6.1 Terra,
-default effort low on Codex 0.164.0). builder-terra61-medium/high/xhigh/max pin
-their effort rung and require the matching SCOPEFUEL_E6_ARM marker.
+default effort low on Codex 0.164.0). builder-terra61-high/xhigh/max are normal
+pinned spellings (hk 2218); builder-terra61-medium still requires its marker.
 codex-terra, codex-terra-max and codex-med resolve for a named refusal:
 gpt-5.6-terra is barred by operator 2026-10-12 noterra.
 ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
@@ -790,8 +792,9 @@ marker in the environment is ignored and never recorded: the quota record
 reads the canonical rung (codex-sol@max, codex-sol@xhigh). The
 old Terra E6 spellings builder-terra-high, builder-terra-xhigh and
 builder-terra-max are refused by operator 2026-10-12 noterra. The separate
-builder-terra61-medium/high/xhigh/max rows are unmeasured E6 rungs and require
-SCOPEFUEL_E6_ARM=codex-terra61@<effort>. For the remaining profiles
+builder-terra61-high/xhigh/max are normal pinned spellings since hk 2218
+(placed canon rows); builder-terra61-medium stays an E6 rung and requires
+SCOPEFUEL_E6_ARM=codex-terra61@medium. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
