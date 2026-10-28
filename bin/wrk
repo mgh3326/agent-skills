@@ -190,6 +190,8 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-mi
   wrk worktree-reap [--age 3d] [--apply]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE] [--job JOB] [--lane LANE] [--policy PATH]
+  wrk artifacts classify [--job JOB] [--root NAME] [--json]
+  wrk artifacts mark-final JOB PATH --by LANE
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -10433,6 +10435,7 @@ spillover_remote_spawn() {
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
   [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
+  [[ -n "${SCOPEFUEL_E6_ARM:-}" ]] && remote_args+=("SCOPEFUEL_E6_ARM=$SCOPEFUEL_E6_ARM")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   [[ -z "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "$SPILL_REMOTE_OWNER") # hk2042-ssh-owner
   [[ -z "${SPILL_REMOTE_REPORT_REL:-}" ]] || remote_args+=(--report-relative "$SPILL_REMOTE_REPORT_REL")
@@ -11105,19 +11108,15 @@ pi_host_precheck() {
 }
 
 # hk 2140 desk gate: Command Code accounts with no configured MCP servers are
-# known only on mbp, desktop and m1b. Require an explicit local capability flag
-# and an execution-host identity in that desk-approved set; caller placement
-# options never grant this capability.
+# desk-owned per host. Approval is the desk-owned [local] cmd_dsflash41 = true
+# flag alone; caller placement options and host identities never grant this
+# capability.
 cmd_host_precheck() {
   local profile="${1:-${MODEL:-}}" host
   [[ "$profile" == cmd-dsflash41 ]] || return 0
   host="$(spillover_value hub machine_id 2>/dev/null || true)"
   [[ -n "$host" ]] || host="$(hostname)"
   host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
-  case "$host" in
-    mbp|desktop|m1b) ;;
-    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
-  esac
   if ! local_spawn_scan; then
     die "$profile refused on host $host: $LOCAL_SPAWN_ERROR"
   fi
@@ -14166,44 +14165,42 @@ Report — and with --apply, remove — what ended or stale jobs leave behind:
     whose job already ended)
   * job artifacts per the policy file (schema fleet.artifact-policy.v1;
     default director/artifact_policy.json next to this wrk, --policy or
-    WRK_ARTIFACT_POLICY overrides): named roots sit relative to the fleet
-    work root and each row names a class, a root and a glob inside a job
-    dir. This pass knows exactly two classes:
+    WRK_ARTIFACT_POLICY overrides): roots are relative to the fleet work
+    root and rows name a class, root and glob. A root can be per-job (the
+    default for legacy string roots) or flat. The loader accepts record-text,
+    evidence, final-build, intermediate-build, cache, worktree and protected.
+    This pass acts only on cache and intermediate-build:
       - cache: deleted only when the job is ended (terminal record after
         the newest revive), its hk task reads merged or dropped (read-only
         lookup; any failure keeps the match), no live completion sentinel
         or pane exists, and the job has been quiet past --heavy-age
         (default 3d)
       - intermediate-build: in ANY job state, every match beyond the
-        keep_newest newest (1 or 2, ordered by the newest mtime inside
+        keep_newest newest (1, 2 or 3, ordered by the newest mtime inside
         each match) is deleted; nothing is deleted at or below the count
         or when an mtime is unreadable
-    Other classes — evidence, final-build, record text — are out of scope
-    and rejected on load: the artifact-store sweeper uploads them first
-    (design hk:doc designs/b953/artifact-store). A symlinked match inside
-    the job dir is unlinked, never traversed; a match whose real path
-    leaves the job dir is refused; a unity path is skipped while the pa
-    unity lock (/tmp/pa-m1-unity.lock) is held; any path a live process
-    still has open (lsof) is skipped. Every removal prints its class and
-    bytes, appends a job.artifacts_pruned event for a jobs-root match,
-    and logs to <jobs-root>/prune.log for the other roots. An invalid
-    policy (unknown keys, an absolute or .. glob, a glob that leaves the
-    job dir) refuses the whole pass.
+    Record-text, evidence, final-build and protected are keep classes;
+    worktree is a reference row for wrk worktree-reap. They are accepted by
+    the shared policy loader and never removed by this pass. Only cache and
+    intermediate-build rows can act here. A match resolving outside the job
+    dir is refused; a Unity path is skipped while the pa Unity lock
+    (/tmp/pa-m1-unity.lock) is held; a path with a live open handle (lsof) is
+    skipped. Every removal prints its class and bytes, appends a
+    job.artifacts_pruned event for a jobs-root match, and logs to
+    <jobs-root>/prune.log for other roots. An invalid policy refuses the
+    whole pass.
     Never touched, whatever the policy rows say: at any depth under a job
     dir, a path whose own name or any ancestor name matches one of
       @NEVER_TOUCH@
     (names are matched case-insensitively; a job dir of such a name is
     wholly guarded). A match that is such a path, sits under one, or is a
-    directory holding one (or a link to one, or another refused match) is
-    refused, and a refused match takes no keep_newest slot. A symlink
-    match is held to the same rule and to the job-dir containment: it is
-    checked where it physically sits and at its resolved target, and a
-    link whose either end hits the set or leaves the job dir is refused,
-    not unlinked. A name with a control character cannot be framed in the
-    scan record and is refused (unsafe-path). Under a recursive glob a
-    dropped match that holds a kept match, or sits inside one, stays. A
-    glob with more than 20000 matches in one job dir (a symlink cycle
-    under ** does that) skips the job (scan-failed).
+    directory holding one, a link to one, or another refused match is
+    refused and takes no keep_newest slot. Links are checked at their seat
+    and resolved target; a link hitting the set or leaving the job dir is
+    refused, not unlinked. Names with control characters are refused as
+    unsafe-path. Under recursive globs, a dropped match holding a kept
+    match, or sitting inside one, stays. More than 20000 matches in one job
+    dir skips that job (scan-failed).
 
 Dry-run is the default and prints one line per item with job id, pid, age,
 pane state and the exact reason it is or is not an orphan. --apply stops
@@ -14349,12 +14346,11 @@ prune_sentinel_row() {
 # ── hk 2090: artifact prune pass ─────────────────────────────────────────
 # The artifact pass applies director/artifact_policy.json (schema
 # fleet.artifact-policy.v1): named roots relative to the fleet work root
-# (the jobs root's grandparent — ~/work by default), rows of class "cache"
-# or "intermediate-build", each row a glob relative to a job dir. Anything
-# not proven is skipped; a broken policy refuses the whole pass; a symlink
-# is unlinked, never traversed; a match resolving outside its job dir is
-# refused. Evidence, final builds and record text are out of scope — the
-# artifact-store sweeper (designs/b953/artifact-store) uploads them first.
+# (the jobs root's grandparent — ~/work by default), with per-job or flat
+# scope. Rows use all supported artifact classes; only cache and
+# intermediate-build can act here. Anything not proven is skipped; a broken
+# policy refuses the whole pass; symlinks and matches resolving outside their
+# applicable root are refused.
 
 # The never-touch set: the ONE definition. The scanner enforces it on every
 # match — file, directory or link — and wrk prune --help prints it. Names,
@@ -14376,17 +14372,19 @@ print(os.path.join(os.path.dirname(os.path.dirname(
 }
 
 # prune_artifact_policy_load POLICY WORK_ROOT — validate the policy and print
-# one TSV row per rule: class, root name, resolved absolute root, glob and
-# keep_newest ("" for cache). Any violation prints REFUSE<TAB>reason and
+# one TSV row per rule: class, root name, resolved root, root kind, glob,
+# keep_newest, host, job, mirror_required, and source row index. Any violation prints REFUSE<TAB>reason and
 # exits 3: a broken policy must refuse the whole pass, never be half-applied.
 # Rows print only once every row has passed, so a refusal is that one line.
 prune_artifact_policy_load() {
   python3 - "$1" "$2" <<'PY'
 import json, os, re, sys
 path, work_root = sys.argv[1], sys.argv[2]
-CLASSES = ("cache", "intermediate-build")
-ROW_KEYS = {"class", "root", "glob", "keep_newest"}
-NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+CLASSES = ("record-text", "evidence", "final-build", "intermediate-build",
+           "cache", "worktree", "protected")
+ROW_KEYS = {"class", "root", "glob", "keep_newest", "host", "job",
+            "mirror_required"}
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
 def refuse(msg):
@@ -14409,14 +14407,23 @@ roots = doc["roots"]
 if not isinstance(roots, dict) or not roots:
     refuse("roots must be a non-empty object")
 resolved = {}
-for name, rel in roots.items():
+for name, spec in roots.items():
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         refuse("bad root name %r" % (name,))
-    if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+    if isinstance(spec, str):
+        rel, kind = spec, "per-job"
+    elif isinstance(spec, dict) and set(spec) == {"path", "kind"}:
+        rel, kind = spec["path"], spec["kind"]
+    else:
+        refuse("root %s must be a path string or {path, kind}" % name)
+    if kind not in ("per-job", "flat"):
+        refuse("root %s kind must be per-job or flat" % name)
+    if (not isinstance(rel, str) or not rel or os.path.isabs(rel) or
+            re.match(r"^[A-Za-z]:[/\\]", rel) or rel.startswith("\\\\")):
         refuse("root %s must be a relative path" % name)
-    if any(part in ("", ".", "..") for part in rel.split("/")):
+    if rel != "." and any(part in ("", ".", "..") for part in rel.split("/")):
         refuse("root %s path %r is not a clean relative path" % (name, rel))
-    resolved[name] = os.path.normpath(os.path.join(work_root, rel))
+    resolved[name] = (os.path.normpath(os.path.join(work_root, rel)), kind)
 rows = doc["rows"]
 if not isinstance(rows, list):
     refuse("rows must be a list")
@@ -14429,27 +14436,65 @@ for index, row in enumerate(rows):
         refuse("row %d unknown keys %s" % (index, ",".join(unknown)))
     cls = row.get("class")
     if cls not in CLASSES:
-        refuse("row %d class %r is not yet supported" % (index, cls))
+        refuse("row %d class %r is unknown" % (index, cls))
     root = row.get("root")
-    if root not in resolved:
+    if not isinstance(root, str) or root not in resolved:
         refuse("row %d names an unknown root %r" % (index, root))
+    root_path, root_kind = resolved[root]
+    host = row.get("host", "")
+    if "host" in row and (not isinstance(host, str) or not NAME_RE.fullmatch(host)):
+        refuse("row %d host must be a host name" % index)
+    job = row.get("job", "")
+    if "job" in row and (not isinstance(job, str) or not NAME_RE.fullmatch(job)):
+        refuse("row %d job must be a job id" % index)
+    if job and root_kind != "per-job":
+        refuse("row %d job is only valid for a per-job root" % index)
+    mirror = row.get("mirror_required", False)
+    if not isinstance(mirror, bool) or ("mirror_required" in row and cls != "evidence"):
+        refuse("row %d mirror_required is only a boolean on evidence rows" % index)
     pat = row.get("glob")
     if not isinstance(pat, str) or not pat:
         refuse("row %d glob must be a non-empty string" % index)
-    if os.path.isabs(pat):
+    if os.path.isabs(pat) or re.match(r"^[A-Za-z]:[/\\]", pat) or pat.startswith("\\\\"):
         refuse("row %d glob %r is absolute" % (index, pat))
     if any(part in ("", "..") for part in pat.split("/")):
         refuse("row %d glob %r can leave the job dir" % (index, pat))
     if os.path.normpath(pat) == ".":
         refuse("row %d glob %r names the job dir itself" % (index, pat))
+    # Python glob accepts only *, ?, [...] and ** as a whole path segment.
+    # Refuse brace expansion and character class negation before matching.
+    if "{" in pat or "}" in pat:
+        refuse("row %d glob %r uses unsupported brace syntax" % (index, pat))
+    if "\\" in pat:
+        refuse("row %d glob %r uses unsupported escaping" % (index, pat))
+    if any("**" in segment and segment != "**" for segment in pat.split("/")):
+        refuse("row %d glob %r uses ** outside a whole path segment" % (index, pat))
+    cursor = 0
+    while cursor < len(pat):
+        if pat[cursor] == "]":
+            refuse("row %d glob %r has malformed character class" % (index, pat))
+        if pat[cursor] != "[":
+            cursor += 1
+            continue
+        end = pat.find("]", cursor + 1)
+        if end < 0 or end == cursor + 1:
+            refuse("row %d glob %r has malformed character class" % (index, pat))
+        chars = pat[cursor + 1:end]
+        if chars[0] in ("!", "^"):
+            refuse("row %d glob %r uses unsupported character class negation" % (index, pat))
+        if "[" in chars:
+            refuse("row %d glob %r has malformed character class" % (index, pat))
+        cursor = end + 1
     keep = row.get("keep_newest")
     if cls == "intermediate-build":
-        if not isinstance(keep, int) or isinstance(keep, bool) or keep not in (1, 2):
-            refuse("row %d keep_newest must be 1 or 2" % index)
-    elif keep is not None:
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep not in (1, 2, 3):
+            refuse("row %d keep_newest must be 1, 2 or 3" % index)
+    elif "keep_newest" in row:
         refuse("row %d keep_newest is only valid for intermediate-build" % index)
-    out.append("\t".join((cls, root, resolved[root], pat,
-                          "" if keep is None else str(keep))))
+    out.append("\t".join((cls, root, root_path, root_kind, pat,
+                          "-" if keep is None else str(keep),
+                          host or "-", job or "-",
+                          "true" if mirror else "false", str(index))))
 for line in out:
     print(line)
 PY
@@ -14534,7 +14579,6 @@ def newest_mtime(root):
                 except OSError:
                     return None
     return newest
-
 
 def hits(names):
     """Any of NAMES matches the never-touch set (case-insensitive)."""
@@ -14879,6 +14923,78 @@ PY
   fi
 }
 
+# Print the first applicable keep-class row that matches, contains or is
+# contained by a candidate. The same rule protects cache and build paths.
+prune_artifact_keep_conflict() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import glob, os, sys
+jobdir, candidate, rows, actual_host = sys.argv[1:]
+candidate = os.path.realpath(candidate)
+for line in rows.splitlines():
+    f = line.split("\t")
+    if len(f) != 10 or f[0] not in {"record-text", "evidence", "final-build", "protected"}:
+        continue
+    cls, _name, root, kind, pattern, _keep, row_host, job, _mirror, index = f
+    if kind == "per-job" and root != os.path.dirname(jobdir):
+        continue
+    if kind == "flat" and root != jobdir:
+        continue
+    if job not in ("", "-") and job != os.path.basename(jobdir):
+        continue
+    if row_host not in ("", "-") and row_host != actual_host:
+        continue
+    for keep in glob.glob(os.path.join(jobdir, pattern), recursive=True):
+        keep = os.path.realpath(keep)
+        if candidate == keep or candidate.startswith(keep + os.sep) or keep.startswith(candidate + os.sep):
+            print("row=%s class=%s path=%s" % (index, cls, keep))
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Validate pa-integrator's Web QA SHA contract. On any error print REFUSE and
+# return nonzero, so callers keep every build SHA in that case.
+prune_webqa_protected_shas() {
+  python3 - "$1/webqa-runner/v3/protected-shas.json" <<'PY'
+import datetime, json, os, re, sys
+path = sys.argv[1]
+def refuse(reason):
+    print("REFUSE\t" + reason)
+    raise SystemExit(1)
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError) as exc:
+    refuse("missing-or-unparsable: %s" % exc)
+if not isinstance(data, dict):
+    refuse("invalid-object")
+sha_re = re.compile(r"[0-9a-fA-F]{40}\Z")
+main = data.get("main_sha")
+releases = data.get("release_shas")
+writer = data.get("writer")
+stamp = data.get("written_at")
+if not isinstance(main, str) or not sha_re.fullmatch(main):
+    refuse("invalid-main-sha")
+if not isinstance(releases, list) or any(not isinstance(s, str) or not sha_re.fullmatch(s) for s in releases):
+    refuse("invalid-release-shas")
+if not isinstance(writer, str) or not writer.strip():
+    refuse("invalid-writer")
+if not isinstance(stamp, str) or not stamp:
+    refuse("missing-written-at")
+try:
+    parsed = datetime.datetime.fromisoformat(stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp)
+except ValueError:
+    refuse("invalid-written-at")
+if parsed.tzinfo is None or parsed.utcoffset() != datetime.timedelta(0):
+    refuse("written-at-not-utc")
+now = datetime.datetime.now(datetime.timezone.utc)
+age = (now - parsed.astimezone(datetime.timezone.utc)).total_seconds()
+if age < 0 or age > 24 * 60 * 60:
+    refuse("written-at-not-fresh")
+print("OK\t" + "\n".join(dict.fromkeys([main.lower()] + [s.lower() for s in releases])))
+PY
+}
+
 # prune_artifact_pass APPLY HEAVY_S ONLY_JOB LANE POLICY JOBS_ROOT — pass 6 of
 # wrk prune: policy-driven cache and intermediate-build removal.
 prune_artifact_pass() {
@@ -14888,7 +15004,7 @@ prune_artifact_pass() {
     echo "artifact-prune: no policy file at $policy — pass skipped"
     return 0
   fi
-  local work_root parsed="" rc=0
+  local work_root parsed="" rc=0 artifact_host="${WRK_ARTIFACT_HOST:-${HOSTNAME:-unknown}}"
   work_root="$(dirname "$(dirname "$jobs_root")")"
   parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
   if (( rc != 0 )); then
@@ -14897,14 +15013,19 @@ prune_artifact_pass() {
     echo "artifact-prune refused: $policy — $why"
     return 2
   fi
-  local jobs_real cls root_name abs_root pattern keep
+  local jobs_real cls root_name abs_root root_kind pattern keep row_host row_job mirror row_index
   jobs_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$jobs_root")"
-  local job jobdir entry real_root is_jobs reason state
+  local job jobdir entry real_root is_jobs reason state sha_result sha_rc protected_shas
   local scan_out kind match mtime bytes
   local -a m_kind m_path m_mtime m_bytes todo drop_list kept_list safe_todo is_drop
   local n i j k idx poison owner held
-  while IFS=$'\t' read -r cls root_name abs_root pattern keep; do
+  while IFS=$'\t' read -r cls root_name abs_root root_kind pattern keep row_host row_job mirror row_index; do
     [[ -n "$cls" ]] || continue
+    : "$mirror" "$row_index"
+    [[ "$keep" == "-" ]] && keep=""
+    [[ "$row_host" == "-" ]] && row_host=""
+    [[ "$row_job" == "-" ]] && row_job=""
+    sha_result="" sha_rc=0 protected_shas=""
     PRUNE_ARTIFACT_ROWS=$(( PRUNE_ARTIFACT_ROWS + 1 ))
     if [[ ! -d "$abs_root" ]]; then
       echo "artifact row class=$cls root=$root_name skip=yes reason=root-missing path=$abs_root"
@@ -14913,15 +15034,38 @@ prune_artifact_pass() {
     real_root="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$abs_root")"
     is_jobs=0
     [[ "$real_root" == "$jobs_real" ]] && is_jobs=1
-    for entry in "$abs_root"/*/; do
-      jobdir="${entry%/}"
-      [[ -e "$jobdir" && -d "$jobdir" ]] || continue
-      [[ -L "$jobdir" ]] && continue   # never traverse a symlinked job dir
-      job="${jobdir##*/}"
+    [[ "$root_kind" == flat ]] && is_jobs=0
+    [[ "$row_host" == "" || "$row_host" == "$artifact_host" ]] || continue
+    [[ -z "$lane" || "$root_kind" == per-job ]] || continue
+    if [[ "$root_kind" == flat ]]; then
+      artifact_entries=("$abs_root")
+    else
+      artifact_entries=("$abs_root"/*/)
+    fi
+    for entry in "${artifact_entries[@]}"; do
+      if [[ "$root_kind" == flat ]]; then
+        jobdir="$abs_root"; job="root:$root_name"
+      else
+        jobdir="${entry%/}"
+        [[ -e "$jobdir" && -d "$jobdir" ]] || continue
+        [[ -L "$jobdir" ]] && continue   # never traverse a symlinked job dir
+        job="${jobdir##*/}"
+      fi
+      [[ -d "$jobdir" ]] || continue
       [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
-      if [[ -n "$lane" ]]; then
+      [[ -z "$row_job" || "$row_job" == "$job" ]] || continue
+      if [[ -n "$lane" && "$root_kind" == per-job ]]; then
         owner="$(awk -v j="$job" -F'\t' '$1==j {print $8; exit}' <<<"$PRUNE_SCAN")"
         [[ "$owner" == "$lane" ]] || continue
+      fi
+      if [[ "$cls" == record-text || "$cls" == evidence || "$cls" == final-build ||
+            "$cls" == protected || "$cls" == worktree ]]; then
+        echo "artifact job=$job class=$cls skip=yes reason=keep-class"
+        continue
+      fi
+      if [[ "$root_kind" == flat && "$cls" == cache ]]; then
+        echo "artifact job=$job class=cache skip=yes reason=flat-cache-no-job-state"
+        continue
       fi
       m_kind=() m_path=() m_mtime=() m_bytes=()
       n=0
@@ -14957,6 +15101,24 @@ prune_artifact_pass() {
         n=$(( n + 1 ))
       done <<<"$scan_out"
       (( n )) || continue
+      # Web QA's SHA file is owned by pa-integrator. Missing, stale or invalid
+      # data fails closed; listed SHAs stay in addition to keep_newest.
+      if [[ "$root_kind" == flat && "$root_name" == webqa-v3 && "$pattern" == builds/* ]]; then
+        sha_result="$(prune_webqa_protected_shas "$jobs_root")" || sha_rc=$?
+        if (( sha_rc == 0 )); then protected_shas="${sha_result#OK$'\t'}"; fi
+        for ((i = 0; i < n; i++)); do
+          local sha="${m_path[$i]##*/}" sha_lower listed=0
+          sha_lower="$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')"
+          if (( sha_rc != 0 )); then
+            echo "artifact job=$job class=$cls path=${m_path[$i]} bytes=${m_bytes[$i]} action=skipped reason=protected-sha-source-invalid"
+            continue
+          fi
+          while IFS= read -r protected_sha; do
+            [[ -n "$protected_sha" && "$sha_lower" == "$protected_sha" ]] && listed=1
+          done <<<"$protected_shas"
+          (( listed )) && echo "artifact job=$job class=$cls path=${m_path[$i]} bytes=${m_bytes[$i]} action=skipped reason=protected-sha-listed"
+        done
+      fi
       todo=()
       if [[ "$cls" == cache ]]; then
         reason="$(prune_artifact_cache_reason "$job" "$heavy_s")" || true
@@ -15026,6 +15188,30 @@ prune_artifact_pass() {
           echo "artifact job=$job class=$cls path=$match action=skipped reason=already-gone"
           continue
         fi
+        case "$kind" in
+          outside|guarded|holds|unsafe) continue ;;  # reported by the scanner
+        esac
+        if [[ "$root_kind" == flat && "$root_name" == webqa-v3 && "$pattern" == builds/* ]]; then
+          if (( sha_rc != 0 )); then
+            echo "artifact job=$job class=$cls path=$match action=skipped reason=protected-sha-source-invalid"
+            continue
+          fi
+          local candidate_sha="${match##*/}" candidate_lower protected_sha listed=0
+          candidate_lower="$(printf '%s' "$candidate_sha" | tr '[:upper:]' '[:lower:]')"
+          while IFS= read -r protected_sha; do
+            [[ -n "$protected_sha" && "$candidate_lower" == "$protected_sha" ]] && listed=1
+          done <<<"$protected_shas"
+          if (( listed )); then
+            echo "artifact job=$job class=$cls path=$match action=skipped reason=protected-sha-listed"
+            continue
+          fi
+        fi
+        local keep_conflict=""
+        keep_conflict="$(prune_artifact_keep_conflict "$jobdir" "$match" "$parsed" "$artifact_host")" || true
+        if [[ -n "$keep_conflict" ]]; then
+          echo "artifact job=$job class=$cls path=$match action=skipped reason=keep-class-precedence $keep_conflict"
+          continue
+        fi
         if [[ "$match" == */unity/* || "$match" == */unity ]] &&
            prune_artifact_unity_lock_held; then
           echo "artifact job=$job class=$cls path=$match action=skipped reason=unity-lock-held"
@@ -15055,6 +15241,428 @@ prune_artifact_pass() {
     done
   done <<<"$parsed"
   return 0
+}
+
+artifacts_help() {
+  cat <<'USAGE'
+Usage: wrk artifacts <classify|mark-final|move> [options]
+
+Commands:
+  classify [--job JOB] [--root NAME] [--json]
+             report artifact classes, never-touch paths and heavy unclassified paths
+  mark-final JOB PATH --by LANE
+             mark one final build in a job directory
+  move SRC_TREE --dest <drive_folder>/<host>/<name> [--apply] [--source-host H]
+             upload an artifact tree to the fleet artifact store
+
+classify is read-only and reports bytes and paths by class, never-touch,
+conflicts, and heavy unclassified paths. mark-final records one final build.
+
+Web QA v3 builds use <jobs root>/webqa-runner/v3/protected-shas.json, written
+by pa-integrator with main_sha, release_shas, written_at and writer. The UTC
+written_at must be no older than 24 hours. Missing, invalid, stale, future or
+incomplete data protects every SHA directory; otherwise the newest three and
+all listed SHAs are kept.
+
+Run 'wrk artifacts <command> --help' for command-specific usage.
+USAGE
+}
+
+artifacts_classify_cmd() {
+  local only_job="" only_root="" as_json=0 policy="${WRK_ARTIFACT_POLICY:-}"
+  [[ -n "$policy" ]] || policy="$(prune_artifact_policy_default)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
+      --root) [[ $# -ge 2 && -n "$2" ]] || die "--root requires a value"; only_root="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -h|--help) artifacts_help; return 0 ;;
+      *) die "artifacts classify: unexpected argument '$1'" ;;
+    esac
+  done
+  local jobs_root work_root host parsed rc=0
+  jobs_root="$(wrk_jobs_root)"; work_root="$(dirname "$(dirname "$jobs_root")")"
+  host="${WRK_ARTIFACT_HOST:-${HOSTNAME:-unknown}}"
+  parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
+  (( rc == 0 )) || die "artifacts classify: invalid policy: ${parsed#REFUSE	}"
+python3 - "$parsed" "$host" "$only_job" "$only_root" "$as_json" "$(wrk_jobs_root)" "$PRUNE_NEVER_TOUCH" <<'PY'
+import fnmatch, glob, hashlib, json, os, sys
+rows_text, host, only_job, only_root, as_json, jobs_root, never_text = sys.argv[1:]
+NEVER = [pat.casefold() for pat in never_text.split()]
+if not NEVER:
+    raise SystemExit("never-touch set missing; classification refused")
+rows=[]
+for line in rows_text.splitlines():
+    f=line.split("\t")
+    if len(f)==10:
+        cls,name,root,kind,pat,keep,rhost,job,mirror,index=f
+        rhost = "" if rhost == "-" else rhost
+        job = "" if job == "-" else job
+        if (rhost and rhost != host) or (only_root and name != only_root): continue
+        rows.append(dict(cls=cls,name=name,root=root,kind=kind,pat=pat,
+                         keep=keep,host=rhost,job=job,mirror=mirror,index=index))
+
+def size(path):
+    try:
+        if os.path.islink(path): return os.lstat(path).st_size
+        if os.path.isfile(path): return os.path.getsize(path)
+        total=0
+        for base,dirs,files in os.walk(path, followlinks=False):
+            for n in files:
+                p=os.path.join(base,n)
+                try: total += os.lstat(p).st_size
+                except OSError: pass
+        return total
+    except OSError: return 0
+
+def newest_mtime(path):
+    try: newest=os.lstat(path).st_mtime
+    except OSError: return 0
+    if os.path.isdir(path) and not os.path.islink(path):
+        for base,dirs,files in os.walk(path,followlinks=False):
+            for name in dirs+files:
+                try: newest=max(newest,os.lstat(os.path.join(base,name)).st_mtime)
+                except OSError: return 0
+    return newest
+
+def class_total(paths):
+    measured={}
+    for path in paths:
+        if os.path.islink(path):
+            try: measured[os.path.abspath(path)]=os.lstat(path).st_size
+            except OSError: pass
+        elif os.path.isfile(path):
+            try: measured[os.path.realpath(path)]=os.path.getsize(path)
+            except OSError: pass
+        elif os.path.isdir(path):
+            for base,dirs,files in os.walk(path,followlinks=False):
+                for name in dirs+files:
+                    p=os.path.join(base,name)
+                    try:
+                        if os.path.islink(p): measured[os.path.abspath(p)]=os.lstat(p).st_size
+                        elif os.path.isfile(p): measured[os.path.realpath(p)]=os.path.getsize(p)
+                    except OSError: pass
+    return sum(measured.values())
+
+def hits(parts):
+    return any(fnmatch.fnmatchcase(str(part).casefold(), pattern)
+               for part in parts for pattern in NEVER)
+
+def inside_parts(path, base):
+    try:
+        relative = os.path.relpath(os.path.realpath(path), os.path.realpath(base))
+    except (OSError, ValueError):
+        return None
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return None
+    return [] if relative == "." else relative.split(os.sep)
+
+def guarded(path, base):
+    """Use the prune scanner's set and fail closed for every physical path."""
+    base_name = os.path.basename(os.path.normpath(base))
+    try:
+        lexical = os.path.relpath(path, base)
+    except (OSError, ValueError):
+        return True
+    lexical_parts = [] if lexical == "." else lexical.split(os.sep)
+    if hits([base_name] + lexical_parts):
+        return True
+    physical = inside_parts(path, base)
+    if physical is None or hits([base_name] + physical):
+        return True
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    unreadable = []
+    for current, dirs, files in os.walk(path, topdown=True, followlinks=False,
+                                         onerror=unreadable.append):
+        if hits(dirs + files):
+            return True
+        for name in dirs + files:
+            entry = os.path.join(current, name)
+            if not os.path.islink(entry):
+                continue
+            target_parts = inside_parts(entry, base)
+            if target_parts is None or hits([base_name] + target_parts):
+                return True
+    return bool(unreadable)
+
+jobs={}
+webqa_sha_status = "not-applicable"
+webqa_protected = set()
+try:
+    with open(os.path.join(jobs_root,"webqa-runner/v3/protected-shas.json"),encoding="utf-8") as handle:
+        sha_doc=json.load(handle)
+    import datetime, re
+    main=sha_doc.get("main_sha"); releases=sha_doc.get("release_shas")
+    writer=sha_doc.get("writer"); stamp=sha_doc.get("written_at")
+    valid_sha=lambda x: isinstance(x,str) and re.fullmatch(r"[0-9a-fA-F]{40}",x)
+    if not valid_sha(main) or not isinstance(releases,list) or any(not valid_sha(x) for x in releases): raise ValueError("invalid sha")
+    if not isinstance(writer,str) or not writer.strip() or not isinstance(stamp,str) or not stamp: raise ValueError("missing metadata")
+    parsed_stamp=datetime.datetime.fromisoformat(stamp[:-1]+"+00:00" if stamp.endswith("Z") else stamp)
+    if parsed_stamp.tzinfo is None or parsed_stamp.utcoffset()!=datetime.timedelta(0): raise ValueError("not utc")
+    age=(datetime.datetime.now(datetime.timezone.utc)-parsed_stamp.astimezone(datetime.timezone.utc)).total_seconds()
+    if age<0 or age>86400: raise ValueError("stale or future")
+    webqa_protected={main.lower(),*(x.lower() for x in releases)}
+    webqa_sha_status="valid"
+except (OSError,ValueError,TypeError,AttributeError):
+    webqa_sha_status="fail-closed"
+for row in rows:
+    if row['kind'] != 'per-job' or not os.path.isdir(row['root']): continue
+    for job in ([only_job] if only_job else os.listdir(row['root'])):
+        base=os.path.join(row['root'],job)
+        if os.path.isdir(base) and not os.path.islink(base):
+            jobs.setdefault(job,{"classes":{},"never_touch":[],"unclassified":[],"conflicts":[],"mirror_required":[]})
+for row in rows:
+    root=row['root']; kind=row['kind']
+    if not os.path.isdir(root): continue
+    if kind=='per-job':
+        names=[only_job] if only_job else sorted(os.listdir(root))
+        for job in names:
+            if row['job'] and row['job'] != job: continue
+            base=os.path.join(root,job)
+            if not os.path.isdir(base) or os.path.islink(base): continue
+            matches=glob.glob(os.path.join(base,row['pat']),recursive=True)
+            out=jobs.setdefault(job,{"classes":{},"never_touch":[],"unclassified":[],"conflicts":[],"mirror_required":[]})
+            for p in matches:
+                if guarded(p,base):
+                    if row['cls']=='protected': out['classes'].setdefault('protected',{})[p]=size(p)
+                    if p not in out['never_touch']: out['never_touch'].append(p)
+                    if row['mirror']=='true' and p not in out['mirror_required']: out['mirror_required'].append(p)
+                    continue
+                out['classes'].setdefault(row['cls'],{})[p]=size(p)
+                if row['mirror']=='true' and p not in out['mirror_required']: out['mirror_required'].append(p)
+    else:
+        out=jobs.setdefault("root:"+row['name'],{"classes":{},"never_touch":[],"unclassified":[],"conflicts":[],"mirror_required":[]})
+        for p in glob.glob(os.path.join(root,row['pat']),recursive=True):
+            cls=row['cls']
+            if guarded(p,root):
+                if cls=='protected': out['classes'].setdefault('protected',{})[p]=size(p)
+                if p not in out['never_touch']: out['never_touch'].append(p)
+                if row['mirror']=='true' and p not in out['mirror_required']: out['mirror_required'].append(p)
+                continue
+            out['classes'].setdefault(cls,{})[p]=size(p)
+            if row['mirror']=='true' and p not in out['mirror_required']: out['mirror_required'].append(p)
+
+for job,out in jobs.items():
+    if job == "root:webqa-v3":
+        out['webqa_sha_status']=webqa_sha_status
+        matches=[]
+        for p in glob.glob(os.path.join(next((r['root'] for r in rows if r['name']=='webqa-v3'),''),'builds/*')):
+            matches.append((newest_mtime(p),p))
+        newest_kept={p for _,p in sorted(matches,reverse=True)[:3]}
+        explicit=set()
+        root=next((r['root'] for r in rows if r['name']=='webqa-v3'),'')
+        for p in glob.glob(os.path.join(root,'builds/*')):
+            if webqa_sha_status!='valid' or os.path.basename(p).lower() in webqa_protected or p in newest_kept: explicit.add(p)
+        out['webqa_sha_retention']={"kept":sorted(explicit),"would_remove":sorted(p for _,p in matches if p not in explicit)}
+    # A marked final build is authoritative for this report.
+    if not job.startswith('root:'):
+        marker=os.path.join(next((r['root'] for r in rows if r['kind']=='per-job'),''),job,'final-build.json')
+        try:
+            m=json.load(open(marker,encoding='utf-8')); p=os.path.join(os.path.dirname(marker),m['path'])
+            if os.path.lexists(p):
+                if guarded(p,os.path.dirname(marker)):
+                    out['never_touch'].append(p)
+                else:
+                    out['classes'].setdefault('final-build',{})[p]=size(p)
+        except (OSError,ValueError,KeyError,TypeError): pass
+    # Cross-class and keep-vs-delete overlaps are visible in the report.
+    owners={}
+    for cls,paths in out['classes'].items():
+        for p in paths: owners.setdefault(os.path.realpath(p),[]).append(cls)
+    for p,classes in owners.items():
+        if len(set(classes))>1: out['conflicts'].append({"path":p,"classes":sorted(set(classes))})
+    owner_paths=list(owners.items())
+    keep={"record-text","evidence","final-build","protected"}
+    delete={"cache","intermediate-build"}
+    for p,classes in owner_paths:
+        for q,qclasses in owner_paths:
+            if p==q or not (p.startswith(q+os.sep) or q.startswith(p+os.sep)): continue
+            if (set(classes)&keep and set(qclasses)&delete) or (set(classes)&delete and set(qclasses)&keep):
+                out['conflicts'].append({"path":p,"classes":sorted(set(classes+qclasses))})
+    matched=set(owners)
+    # Heavy paths under each applicable scan root, including unknown paths.
+    bases=[]
+    for r in rows:
+        if r['kind']=='per-job' and (not only_job or only_job==job) and (not r['job'] or r['job']==job):
+            bases.append(os.path.join(r['root'],job))
+        elif r['kind']=='flat' and job=='root:'+r['name']:
+            bases.append(r['root'])
+    seen=set()
+    for base in bases:
+        if not os.path.isdir(base): continue
+        for cur,dirs,files in os.walk(base,followlinks=False):
+            for n in dirs+files:
+                p=os.path.join(cur,n); real=os.path.realpath(p)
+                if real in seen: continue
+                seen.add(real)
+                nbytes=size(p)
+                if nbytes<=50*1024*1024: continue
+                if guarded(p,base):
+                    if p not in out['never_touch']: out['never_touch'].append(p)
+                elif not any(real==m or real.startswith(m+os.sep) for m in matched):
+                    out['unclassified'].append({"path":p,"bytes":nbytes})
+    out['classes']={k:{"bytes":class_total(v),"paths":[{"path":p,"bytes":b} for p,b in sorted(v.items())]} for k,v in sorted(out['classes'].items())}
+    out['never_touch']=sorted(set(out['never_touch']))
+    out['mirror_required']=sorted(set(out['mirror_required']))
+    out['unclassified'].sort(key=lambda x:x['path'])
+    conflict_keys={(item['path'],tuple(sorted(set(item['classes'])))) for item in out['conflicts']}
+    out['conflicts']=[{"path":path,"classes":list(classes)} for path,classes in sorted(conflict_keys)]
+result={"host":host,"jobs":jobs}
+if as_json: print(json.dumps(result,sort_keys=True))
+else:
+    for job,out in sorted(jobs.items()):
+        print("job=%s"%job)
+        for cls,entry in out['classes'].items():
+            print("  class=%s bytes=%d"%(cls,entry['bytes']))
+            for item in entry['paths']: print("    %s\t%d"%(item['path'],item['bytes']))
+        for p in out['never_touch']: print("  never-touch\t%s"%p)
+        for p in out['mirror_required']: print("  mirror-required\t%s"%p)
+        for item in out['conflicts']: print("  conflict\t%s\t%s"%(item['path'],','.join(item['classes'])))
+        for item in out['unclassified']: print("  unclassified\t%s\t%d"%(item['path'],item['bytes']))
+PY
+}
+
+artifacts_mark_final_cmd() {
+  [[ $# -ge 4 ]] || die "usage: wrk artifacts mark-final JOB PATH --by LANE"
+  local job="$1" path="$2" by=""; shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --by) [[ $# -ge 2 && -n "$2" ]] || die "--by requires a lane"; by="$2"; shift 2 ;;
+      *) die "artifacts mark-final: unexpected argument '$1'" ;;
+    esac
+  done
+  [[ -n "$by" ]] || die "artifacts mark-final requires --by LANE"
+  if ! ascii_re "$job" '^[A-Za-z0-9._-]+$' || [[ "$job" == . || "$job" == .. ]]; then
+    die "artifacts mark-final: JOB must be a job id"
+  fi
+  local jobdir jobs_root target policy work_root parsed is_cache
+  jobs_root="$(wrk_jobs_root)"; jobdir="$jobs_root/$job"
+  [[ -d "$jobdir" && ! -L "$jobdir" ]] || die "artifacts mark-final: job directory missing or symlinked"
+  if [[ "$path" == /* ]]; then target="$path"; else target="$jobdir/$path"; fi
+  local record
+  record="$(python3 - "$jobdir" "$target" "$by" "$PRUNE_NEVER_TOUCH" <<'PY'
+import fnmatch, hashlib, json, os, stat, sys
+jobdir,path,by,never_text=sys.argv[1:]
+NEVER=[pat.casefold() for pat in never_text.split()]
+if not NEVER: raise SystemExit("artifacts mark-final: never-touch set missing")
+def hits(parts):
+    return any(fnmatch.fnmatchcase(str(part).casefold(),pattern)
+               for part in parts for pattern in NEVER)
+def inside_parts(candidate,base):
+    try: rel=os.path.relpath(os.path.realpath(candidate),os.path.realpath(base))
+    except (OSError,ValueError): return None
+    if rel==os.pardir or rel.startswith(os.pardir+os.sep): return None
+    return [] if rel=="." else rel.split(os.sep)
+def holds_never_touch(root,base_name):
+    unreadable=[]
+    for current,dirs,files in os.walk(root,topdown=True,followlinks=False,onerror=unreadable.append):
+        if hits(dirs+files): return True
+        for name in dirs+files:
+            entry=os.path.join(current,name)
+            if os.path.islink(entry):
+                target=inside_parts(entry,jobdir)
+                if target is None or hits([base_name]+target): return True
+    return bool(unreadable)
+if os.path.islink(path): raise SystemExit("artifacts mark-final: symlink path refused")
+real_job=os.path.realpath(jobdir); real=os.path.realpath(path)
+if real==real_job or not real.startswith(real_job+os.sep): raise SystemExit("artifacts mark-final: path must be inside job directory")
+if not os.path.lexists(path): raise SystemExit("artifacts mark-final: path does not exist")
+rel=os.path.relpath(path,jobdir)
+base_name=os.path.basename(os.path.normpath(jobdir))
+if hits([base_name]+rel.split(os.sep)):
+    raise SystemExit("artifacts mark-final: never-touch path refused")
+physical=inside_parts(path,jobdir)
+if physical is None or hits([base_name]+physical):
+    raise SystemExit("artifacts mark-final: never-touch path refused")
+cursor=jobdir
+for part in rel.split(os.sep):
+    cursor=os.path.join(cursor,part)
+    if os.path.islink(cursor): raise SystemExit("artifacts mark-final: symlink path refused")
+if os.path.isdir(path) and holds_never_touch(path,base_name):
+    raise SystemExit("artifacts mark-final: directory holds a never-touch path")
+st=os.lstat(path)
+if stat.S_ISREG(st.st_mode):
+    h=hashlib.sha256(); n=0
+    with open(path,'rb') as f:
+        for block in iter(lambda:f.read(1024*1024),b''): h.update(block); n+=len(block)
+    sha=h.hexdigest()
+elif stat.S_ISDIR(st.st_mode):
+    h=hashlib.sha256(); n=0
+    for base,dirs,files in os.walk(path,followlinks=False):
+        for name in dirs+files:
+            p=os.path.join(base,name)
+            if os.path.islink(p): raise SystemExit("artifacts mark-final: symlink inside final build refused")
+        dirs.sort()
+        for name in sorted(files):
+            p=os.path.join(base,name); rel=os.path.relpath(p,path).replace(os.sep,'/')
+            fh=hashlib.sha256()
+            with open(p,'rb') as f:
+                for block in iter(lambda:f.read(1024*1024),b''): fh.update(block); n+=len(block)
+            h.update(rel.encode()+b'\0'+fh.digest())
+    sha=h.hexdigest()
+else: raise SystemExit("artifacts mark-final: path must be a regular file or directory")
+print(json.dumps({"path":os.path.relpath(real,real_job).replace(os.sep,'/'),"by":by,"sha256":sha,"bytes":n},sort_keys=True))
+PY
+)" || die "artifacts mark-final: unable to hash path"
+  policy="${WRK_ARTIFACT_POLICY:-$(prune_artifact_policy_default)}"
+  work_root="$(dirname "$(dirname "$jobs_root")")"
+  parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || die "artifacts mark-final: invalid policy"
+  is_cache="$(python3 - "$parsed" "$jobdir" "$target" "${WRK_ARTIFACT_HOST:-${HOSTNAME:-unknown}}" <<'PY'
+import glob,os,sys
+rows,jobdir,target,host=sys.argv[1:]
+for line in rows.splitlines():
+ f=line.split('\t')
+ if len(f)!=10 or f[0]!='cache': continue
+ if f[6] not in ('','-') and f[6]!=host: continue
+ if f[3]=='per-job':
+  if f[7] not in ('','-') and f[7]!=os.path.basename(jobdir): continue
+  base=jobdir
+ else:
+  base=f[2]
+ for p in glob.glob(os.path.join(base,f[4]),recursive=True):
+  a=os.path.realpath(p); b=os.path.realpath(target)
+  if a==b or a.startswith(b+os.sep) or b.startswith(a+os.sep): print('yes'); raise SystemExit
+print('no')
+PY
+)"
+  [[ "$is_cache" != yes ]] || die "artifacts mark-final refuses a cache path"
+  WRK_FINAL_MARK_JSON="$record" wrk_py - "$jobdir" "$job" <<'PY'
+import datetime,json,os,sys,tempfile
+exec(os.environ["WRK_EVENTS_PY"])
+jobdir,job=sys.argv[1:]
+record=json.loads(os.environ["WRK_FINAL_MARK_JSON"])
+record["at"]=datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z')
+marker=os.path.join(jobdir,'final-build.json')
+events=os.path.join(jobdir,'events')
+if os.path.islink(events) or (os.path.lexists(events) and not os.path.isdir(events)):
+ raise SystemExit("artifacts mark-final: events path is not a safe directory")
+os.makedirs(events,exist_ok=True)
+lock=wrk_events_locked(events)
+fd,tmp=tempfile.mkstemp(prefix='.final-build.',dir=jobdir)
+try:
+ with os.fdopen(fd,'w',encoding='utf-8') as f:
+  json.dump(record,f,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
+ os.replace(tmp,marker)
+ event=dict(record); event.update({"kind":"job.final_build_marked","job_id":job})
+ wrk_event_commit(events,'job.final_build_marked',event)
+finally:
+ if os.path.exists(tmp): os.unlink(tmp)
+ lock.close()
+print(json.dumps(record,sort_keys=True))
+PY
+}
+
+artifacts_cmd() {
+  [[ $# -gt 0 ]] || { artifacts_help >&2; return 2; }
+  local sub="$1"; shift
+  case "$sub" in
+    classify) artifacts_classify_cmd "$@" ;;
+    mark-final) artifacts_mark_final_cmd "$@" ;;
+    move) artifacts_move_cmd "$@" ;;
+    -h|--help) artifacts_help ;;
+    *) die "unknown artifacts command '$sub'" ;;
+  esac
 }
 
 prune_cmd() {
@@ -16929,19 +17537,6 @@ finally:
 PY
 }
 
-artifacts_help() {
-  cat <<'USAGE'
-Usage: wrk artifacts <command> [options]
-
-Commands:
-  move        copy a source tree as-is into the Drive folder in batches,
-              confirm upload via fpbulk, evict the Drive-folder copies and
-              record the dataset in hk (dry-run by default)
-
-Run 'wrk artifacts <command> --help' for command-specific usage.
-USAGE
-}
-
 artifacts_move_help() {
   cat <<'USAGE'
 Usage: wrk artifacts move SRC_TREE --dest <drive_folder>/<host>/<name> [--apply]
@@ -16976,14 +17571,6 @@ Exit status: 0 done (or dry-run), 2 usage/config refusal, 3 confirm
 timeout (run stopped, nothing evicted), 4 completed with reported problems
 (evict errors, files changed or skipped).
 USAGE
-}
-
-artifacts_cmd() {
-  case "${1:-}" in
-    -h|--help|help|"") artifacts_help ;;
-    move) shift; artifacts_move_cmd "$@" ;;
-    *) die "unknown artifacts command '$1' (see 'wrk artifacts --help')" ;;
-  esac
 }
 
 artifacts_move_cmd() {
@@ -17753,13 +18340,13 @@ case "${1:-}" in
   worktree-reap) shift; worktree_reap_cmd "$@" ;;
   lanes-missing) shift; lanes_missing_cmd "$@" ;;
   prune) shift; prune_cmd "$@" ;;
+  artifacts) shift; artifacts_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
   heavy) shift; heavy_cmd "$@" ;;
   usage) shift; usage_cmd "$@" ;;
-  artifacts) shift; artifacts_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac
