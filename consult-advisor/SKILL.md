@@ -19,7 +19,7 @@ description: 판단이 어려운 문제(설계 분기, 검증 판정 불일치, 
 
 - 질의 전 요청자 레인이 hub에 등록되어 있는지 확인한다. 미등록 레인의 emit은 조용히 유실된다
   (근거: 2026-09-14 실사고 — 6건 전량 드롭, 부분 배달 0).
-- **세션 이름 지정 시**: `wrk find <이름>`으로 상존·화면 확인 → 있으면 **ask-session 스킬
+- **세션 이름 지정 시**: `wrk find <이름>`으로 상존·화면 확인 → 있으면 **relay-handoff의 질의 절차
   절차**로 질의. 없으면 아래 경로로.
 - **급 지정(기본)**: `scopefuel --recommend S+`로 후보를 뽑는다(모델명을 이 문서에 적지 말 것
   — 정본은 scopefuel).
@@ -73,7 +73,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
   (`wrk reap`, panewire 세션 회수 보고)가 후보로 올리지 않는다. 다 쓴 자문 pane 은 요청자가
   직접 닫는다.
 - 주입·제출검증 = **relay-handoff §3**, pane kind별 통지·대기·착지 확인의 정본과
-  답변 회수 분기는 **relay-handoff §3-1** 및 **ask-session §3**(답변 파일 계약)를 따른다.
+  답변 회수 분기는 **relay-handoff §3-1** 및 **relay-handoff references/session-questions.md §3**(답변 파일 계약)를 따른다.
 - 자문자는 수신자가 claude pane인 기본 경로에서 답변 파일을 작성한 직후 아래 통지를 반드시 실행한다:
 
   ```bash
@@ -99,7 +99,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
 - 자문 난도가 높으면 **2계열 교차 자문**(예: opus + sol)으로 판정 일치 여부까지 확인 —
   불일치면 그 자체가 "운영자 표면화" 신호다.
 - **상존 세션 질의가 나은 경우**: 그 세션의 컨텍스트가 자산일 때(예: orch의 전황, 분석을
-  직접 쓴 세션). 이때는 스폰 없이 ask-session으로.
+  직접 쓴 세션). 이때는 스폰 없이 relay-handoff의 질의 절차로.
 - (예외) 단답 확인·형식 검증처럼 맥락 보존 가치가 없는 질문만 headless 1회성 허용:
   `claude -p --model opus` / `codex exec -c model_reasoning_effort=xhigh` /
   `kiro-cli chat --no-interactive --trust-tools=` / `agy -p --add-dir <repo>`.

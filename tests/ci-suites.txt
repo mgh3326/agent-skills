@@ -13,7 +13,6 @@ suites-a|bash tests/test-worktree-reap.sh
 suites-a|bash tests/test-round-cap.sh
 suites-a|bash tests/test-wrk-rounds.sh
 suites-a|bash tests/test-fleet-rev.sh
-suites-a|bash tests/test-acp-runner-process-group.sh
 suites-b|bash tests/test-codex-project-trust.sh
 suites-b|bash tests/test-arbiter.sh
 suites-b|bash tests/test-openai-independent-gate.sh
@@ -43,7 +42,6 @@ suites-b|bash tests/needs-full-macos.sh
 python|python3 tests/test-node-ops.py
 python|python3 -m unittest tests/test_pa_review_scan.py -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
-python|python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_artifacts.py' -v

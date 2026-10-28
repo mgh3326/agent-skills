@@ -112,19 +112,6 @@
       }
     },
     {
-      "row": 9,
-      "site": "agent-skills AS director/bin/quota-stale-report:57 read_events/:91 categorize/:110 main",
-      "required_change": "Local completed_no_release/reaped/lost buckets remain observations. A protected cleanup candidate requires a fresh canonical completed/end and \u00a72 receipt_required lookup, including reviewers; report cannot authorize release from the local bucket.",
-      "owner": "C2 hk 1927",
-      "source": {
-        "section": "6a",
-        "table": "Receipt consumer inventory",
-        "table_name": "inventory",
-        "row": 9,
-        "row_text": "| agent-skills AS director/bin/quota-stale-report:57 read_events/:91 categorize/:110 main | Local completed_no_release/reaped/lost buckets remain observations. A protected cleanup candidate requires a fresh canonical completed/end and \u00a72 receipt_required lookup, including reviewers; report cannot authorize release from the local bucket. | C2 hk 1927 |"
-      }
-    },
-    {
       "row": 10,
       "site": "agent-skills AS bin/wrk:10147 hk_task_takeover_rebind and :10178 old-job release; :10385 spawn_cmd and :10258 hk_task_link",
       "required_change": "Central successor/claim transaction replaces protected legacy rebind/link; old end and new claim receipts precede release/spawn. Scoped reviewer spawn follows \u00a76, never generic task claim.",
@@ -373,7 +360,7 @@
     },
     {
       "row": 29,
-      "site": "agent-skills AS orchestrate/SKILL.md:99\u2013102 cleanup; spawn-worker/SKILL.md:486\u2013595 spawn/landing and :1044\u20131128 cleanup (process)",
+      "site": "agent-skills AS spawn-worker/SKILL.md:486\u2013595 spawn/landing and :1044\u20131128 cleanup (process)",
       "required_change": "Replace direct arbiter terminal release with shared receipt gate, preserve unstarted reservation compensation rule above; include \u00a76 Q13/P1 assignment/open-before-pane order.",
       "owner": "K1 hk 1929",
       "source": {
@@ -381,7 +368,7 @@
         "table": "Receipt consumer inventory",
         "table_name": "inventory",
         "row": 29,
-        "row_text": "| agent-skills AS orchestrate/SKILL.md:99\u2013102 cleanup; spawn-worker/SKILL.md:486\u2013595 spawn/landing and :1044\u20131128 cleanup (process) | Replace direct arbiter terminal release with shared receipt gate, preserve unstarted reservation compensation rule above; include \u00a76 Q13/P1 assignment/open-before-pane order. | K1 hk 1929 |"
+        "row_text": "| agent-skills AS spawn-worker/SKILL.md:486\u2013595 spawn/landing and :1044\u20131128 cleanup (process) | Replace direct arbiter terminal release with shared receipt gate, preserve unstarted reservation compensation rule above; include \u00a76 Q13/P1 assignment/open-before-pane order. | K1 hk 1929 |"
       }
     },
     {
