@@ -260,6 +260,17 @@ class CmdSpawnTests(unittest.TestCase):
                 self.assertEqual(self.log("gate.log").splitlines()[0],
                                  f"gate -m cmd-dsflash41 --effort high --role {role}")
 
+    def test_placed_rung_on_a_stale_catalog_needs_no_e6_marker(self):
+        # hk 2188 T1 scope: only the builder seat requires a fresh canon
+        # answer. A worker or tester on a placed rung still spawns unarmed
+        # when the catalog answer is stale.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                result = self.spawn(role=role, arm="", WRK_LAUNCH_MODE="stale")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertNotIn("E6", result.stdout)
+
     def test_e6_marker_exact(self):
         # E6-carrier rungs keep the marker rule: cmd@low with a mismatched
         # arm is refused, and unarmed dies the same way.

@@ -391,6 +391,16 @@ else:
         result = self.spawn(profile="pi-haiku55", effort="medium")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_placed_rung_on_a_stale_catalog_needs_no_e6_marker(self):
+        # hk 2188 T1 scope: only the builder seat requires a fresh canon
+        # answer. A worker or tester on a placed rung still spawns unarmed
+        # when the catalog answer is stale.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                result = self.spawn(role=role, SCOPEFUEL_E6_ARM="", WRK_LAUNCH_MODE="stale")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+
     def test_e6_marker_exact(self):
         # E6/consult_only rungs keep the marker rule: a mismatched arm names
         # the exact required marker.
