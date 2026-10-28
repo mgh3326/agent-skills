@@ -116,7 +116,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   esac
   shift 2
   launch_profile="${1:-}"; shift || true
-  launch_effort="" launch_operator=0 launch_purpose=""
+  launch_effort="" launch_operator=0 launch_purpose="" launch_role=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
@@ -126,7 +126,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
         if [[ $# -gt 0 && "${1:-}" != --* ]]; then shift; fi
         ;;
       --purpose) launch_purpose="${2:-}"; shift 2 ;;
-      --role) shift 2 ;; # New seat argument; grant semantics are tested against real scopefuel.
+      --role) launch_role="${2:-}"; shift 2 ;;
       --effort) launch_effort="${2:-}"; shift 2 ;;
       *) echo "fixture scopefuel: unexpected policy launch argument '$1'" >&2; exit 2 ;;
     esac
@@ -180,6 +180,23 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
     pi-opus55@low) launch_grade=S ;;
     pi-opus55@max) launch_gate=escalation ;;
     cmd-dsflash41@high) launch_grade=A+ ;;
+  esac
+  # hk 2188 r3 (309-b): the credit rows are seat-aware exactly like the real
+  # canon (scopefuel PR 219): worker/tester/builder seats only, the builder
+  # only on a placed default-gate rung, and a call naming no seat refused.
+  case "$launch_profile" in
+    pi-haiku55|pi-sonnet55|pi-opus55|cmd-dsflash41)
+      case "$launch_role" in
+        worker|tester) : ;;
+        builder)
+          if [[ "$launch_gate" != default ]]; then
+            echo "error: role_restricted: $launch_profile@$launch_effort — worker/tester only" >&2
+            exit 3
+          fi ;;
+        *)
+          echo "error: role_restricted: $launch_profile@$launch_effort — placed credit rung — worker/tester/builder seats only" >&2
+          exit 3 ;;
+      esac ;;
   esac
   launch_model="$(catalog_model_for "$launch_profile" "$launch_effort")"
   # Lets a test prove the launcher really reads the canon: serve a model id that

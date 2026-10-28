@@ -48,4 +48,5 @@ python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_artifacts.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_cmd.py' -v
+python|python3 -m unittest discover -s tests -p 'test_fixture_scopefuel_parity.py' -v
 python|python3 -m unittest discover -s tests/o3 -p 'test_*.py' -v

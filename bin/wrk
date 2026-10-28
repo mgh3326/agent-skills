@@ -12205,7 +12205,6 @@ hk_task_precheck() {
     hk_task_gate_failure "handoffkeep tasks show rc=$rc: ${out:0:200}"
     return 0
   fi
-  TASK_REQUESTED_GRADE="$(hk_task_grade "$out")"
   if [[ -n "${ROUND_EXT_REF:-}" ]]; then
     # The grant needs an unambiguous server binding. Do not transport task
     # fields through shell IFS: empty fields and embedded TABs shift columns.
@@ -12355,7 +12354,6 @@ hk_task_takeover_precheck() {
   rc=$?
   set -e
   [[ "$rc" -eq 0 ]] || die "takeover refused: handoffkeep tasks show failed: ${out:0:200}"
-  TASK_REQUESTED_GRADE="$(hk_task_grade "$out")"
   parsed="$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
@@ -12566,11 +12564,13 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
 # answer, an ungraded rung or an unmarked task grade all stay refused. The
 # quota gate below still judges the seat — this check only decides whether
 # the builder role may reach it.
-# hk 2188: the O3-verified path reads only the grade from the bound task (a
-# read-only `tasks show`); any failure leaves it empty, and the builder seat
-# check then refuses (fail closed). Other seats never need it.
-o3_task_requested_grade() {
-  [[ "$ROLE" == builder && -n "$TASK_ID" ]] || return 0
+# hk 2188 r3 (309-a): the builder seat check reads the requested grade from
+# the bound task itself (read-only `tasks show`), on every spawn path — legacy,
+# takeover and O3-verified alike — so no path can skip it. Any failure leaves
+# it empty and the seat refuses (fail closed).
+task_requested_grade_read() {
+  TASK_REQUESTED_GRADE=""
+  [[ -n "$TASK_ID" ]] || return 0
   local handoffkeep out rc=0
   handoffkeep="$(hk_bin)"
   [[ -n "$handoffkeep" ]] || return 0
@@ -12591,6 +12591,7 @@ builder_seat_canon_check() {
   local effort="${EFFECTIVE_EFFORT:-${DEFAULT_EFFORT:-}}"
   [[ -n "$effort" ]] ||
     die "internal: builder seat canon check ran before effort resolution"
+  task_requested_grade_read
   [[ -n "${TASK_REQUESTED_GRADE:-}" ]] ||
     die "--role builder refuses '$MODEL': the task's requested grade is unreadable — a $MODEL@$effort builder seat opens only on a canon rung whose grade covers it (hk 2188; the task title carries no grade marker or hk was bypassed)"
   if [[ -z "${SCOPEFUEL:-}" ]]; then
@@ -13014,9 +13015,7 @@ spawn_cmd() {
   # #768: read-only hk task probe — fail closed before the quota gate measures
   # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
   if [[ "$O3_SPAWN_VERIFIED" -eq 1 ]]; then
-    # Canonical handshake already verified the task/host/lane binding. hk 2188:
-    # neither precheck runs here, so read the requested grade from that task.
-    o3_task_requested_grade
+    : # Canonical handshake already verified the task/host/lane binding.
   elif [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   else
