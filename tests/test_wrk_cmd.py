@@ -52,14 +52,31 @@ class CmdSpawnTests(unittest.TestCase):
     def hosts(self, content):
         Path(self.env["WRK_HOSTS_CONFIG"]).write_text(content)
 
+    def use_hk(self, grade="A", task="2188", title=None):
+        # A real fixture handoffkeep so the builder canon check can read the
+        # task's requested grade from the title marker.
+        state = self.tmp / "hk-state.json"
+        if title is None:
+            title = f"fixture task (grade {grade}, T2; fixture)"
+        state.write_text(json.dumps({"tasks": {task: {
+            "id": int(task), "title": title,
+            "state": "backlog", "claimed_by": "", "refs": {},
+            "project": "agent-skills"}}}))
+        self.env["HANDOFFKEEP_BIN"] = str(ROOT / "tests/fixtures/handoffkeep")
+        self.env["HK_STATE"] = str(state)
+        return task
+
     def spawn(self, profile="cmd-dsflash41", effort="high", role="worker",
-              purpose=None, operator_request=None, arm=None, cwd=None, **overrides):
+              purpose=None, operator_request=None, arm=None, cwd=None,
+              task="2140", hk_bypass=True, **overrides):
         env = dict(self.env,
                    SCOPEFUEL_E6_ARM=arm if arm is not None else f"{profile}@{effort or 'high'}")
         env.update(overrides)
         command = [str(self.wrk), "spawn", "--host", "local", "-c", str(cwd or self.tmp),
                    "-m", profile, "-p", str(self.brief), "-w", "w", "-l", "cmd-fixture",
-                   "--role", role, "--task", "2140", "--task-hk-bypass", "--t", "T1"]
+                   "--role", role, "--task", task, "--t", "T1"]
+        if hk_bypass:
+            command += ["--task-hk-bypass"]
         if purpose is not None:
             command += ["--purpose", purpose]
         if operator_request is not None:
@@ -150,18 +167,118 @@ class CmdSpawnTests(unittest.TestCase):
                 self.assertEqual(self.log("gate.log").splitlines()[0],
                                  f"gate -m cmd-dsflash41 --effort high --role {role}")
 
-    def test_builder_refused(self):
-        result = self.spawn(role="builder")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("--role builder rejects 'cmd-dsflash41'", result.stderr)
-        self.assertIn("worker/tester-only", result.stderr)
-        self.assertEqual(self.log("gate.log"), "")
-        self.assertFalse((self.tmp / "claims.log").exists())
-        self.assertNotIn("tab create", self.log())
+    def test_builder_seat_desktop_canon_pass_and_mbp_host_refusal(self):
+        # hk 2188: cmd-dsflash41@high is a placed canon rung (A+ default), so
+        # a builder seat covers a grade-A task on an approved desk host. The
+        # same spawn on mbp is refused by the cmd host rule — cmd_dsflash41
+        # stays false there while hk 2180 is open.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        result = self.spawn(role="builder", task="2188", hk_bypass=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("landed=yes", result.stdout)
+        self.assertEqual(self.log("gate.log").splitlines()[0],
+                         "gate -m cmd-dsflash41 --effort high --role builder")
+        (self.tmp / "herdr.log").unlink(missing_ok=True)
+        (self.tmp / "claims.log").unlink(missing_ok=True)
+        self.hosts('[local]\ncmd_dsflash41 = false\n[hub]\nmachine_id = "mbp"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False),
+            "cmd_dsflash41 must be literal true")
+
+    def test_builder_seat_canon_refused_rungs(self):
+        # hk 2188: E6-marker rungs stay refused as builder seats — the canon
+        # row decides, and even an armed SCOPEFUEL_E6_ARM must not open one.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        for effort in ("low", "max"):
+            with self.subTest(effort=effort):
+                self.assert_refused_before_admission(
+                    self.spawn(role="builder", task="2188", hk_bypass=False, effort=effort),
+                    "hk 2188")
+
+    def test_builder_seat_refused_when_task_grade_unreadable(self):
+        # The seat check is fail-closed: an hk bypass leaves the requested
+        # grade unknown and the builder seat stays refused.
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder"), "requested grade is unreadable")
+
+    def test_builder_seat_ignores_inherited_requested_grade(self):
+        # hk 2188 T5: under --task-hk-bypass no grade is read, and an
+        # inherited TASK_REQUESTED_GRADE from the caller's env must not
+        # supply one — the seat stays refused.
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", TASK_REQUESTED_GRADE="C"),
+            "requested grade is unreadable")
+
+    def test_builder_seat_survives_warning_only_stderr(self):
+        # hk 2188 T6: a canon answer whose stderr holds only
+        # 'scopefuel: warning:' lines must not kill wrk under pipefail.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        result = self.spawn(role="builder", task="2188", hk_bypass=False,
+                            WRK_LAUNCH_MODE="warn-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("landed=yes", result.stdout)
+
+    def test_builder_seat_refuses_stale_canon(self):
+        # hk 2188 T1: a builder seat opens only on a fresh canon answer.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False,
+                       WRK_LAUNCH_MODE="stale"),
+            "is stale")
+
+    def test_builder_seat_title_grade_marker_is_anchored(self):
+        # A bare "grade B" earlier in the title must not understate the
+        # "(grade S, T2)" marker — the rung's canon grade (A+) does not
+        # cover an S task, and disagreeing markers read as unreadable.
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.use_hk(title="Downgrade B tests (grade S, T2; fixture)")
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False),
+            "does not cover the task's requested grade S")
+        self.use_hk(title="one (grade A, T2; x) and another (grade S, T2; y)")
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False),
+            "requested grade is unreadable")
+
+    def test_placed_rung_needs_no_e6_marker(self):
+        # hk 2188 scope fold-in: cmd-dsflash41@high is a placed canon row, so
+        # worker and tester seats spawn with no SCOPEFUEL_E6_ARM at all —
+        # the rung is not an E6 sample and none is labelled.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(role=role, arm="")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertNotIn("E6", result.stdout)
+                self.assertEqual(self.log("gate.log").splitlines()[0],
+                                 f"gate -m cmd-dsflash41 --effort high --role {role}")
+
+    def test_placed_rung_on_a_stale_catalog_needs_no_e6_marker(self):
+        # hk 2188 T1 scope: only the builder seat requires a fresh canon
+        # answer. A worker or tester on a placed rung still spawns unarmed
+        # when the catalog answer is stale.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                result = self.spawn(role=role, arm="", WRK_LAUNCH_MODE="stale")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertNotIn("E6", result.stdout)
 
     def test_e6_marker_exact(self):
+        # E6-carrier rungs keep the marker rule: cmd@low with a mismatched
+        # arm is refused, and unarmed dies the same way.
         self.assert_refused_before_admission(
-            self.spawn(arm="cmd-dsflash41@low"), "SCOPEFUEL_E6_ARM=cmd-dsflash41@high")
+            self.spawn(effort="low", arm="cmd-dsflash41@max"),
+            "SCOPEFUEL_E6_ARM=cmd-dsflash41@low")
+        self.assert_refused_before_admission(
+            self.spawn(effort="low", arm=""), "SCOPEFUEL_E6_ARM=cmd-dsflash41@low")
 
     def test_default_effort_is_high(self):
         result = self.spawn(effort=None)
@@ -349,10 +466,18 @@ class CmdMutantTests(unittest.TestCase):
                 '      *) die "$MODEL: deepseek-v4.1-flash accepts cmd effort low|high|max only, not \'$EFFECTIVE_EFFORT\'" ;;',
                 '      *) CMD_EFFORT="$EFFECTIVE_EFFORT" ;;',
                 "test_efforts_the_model_refuses"),
+            # hk 2188 scope mutant: restore the marker requirement for
+            # placed pi/cmd rungs — the unarmed worker/tester spawns go RED.
+            "placed-marker": (
+                'if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then',
+                'if false; then',
+                "test_placed_rung_needs_no_e6_marker"),
+            # hk 2188 mutant: the canon-grade seat check removed — the E6
+            # rung refusals must turn RED.
             "builder": (
-                'die "--role builder rejects \'$MODEL\': cmd seats are worker/tester-only until reps exist (hk 2140)"',
-                ':',
-                "test_builder_refused"),
+                '  builder_seat_canon_check\n\n  quota_gate',
+                '  : # mutant: canon seat check removed\n\n  quota_gate',
+                "test_builder_seat_canon_refused_rungs"),
             "effort-proof": (
                 'if not re.fullmatch(re.escape(want) + r" · \\S.*", line):',
                 'if not re.fullmatch("# models: " + re.escape(expected_model) + r" with \\S+ effort · \\S.*", line):',

@@ -89,6 +89,7 @@ jobs:
             tests/test-ci-any-ref.sh \
             tests/test-wrk-artifacts-move.sh \
             tests/test-wrk-artifacts-routing.sh \
+            tests/test-wrk-artifacts-sweep.sh \
             tests/test-wrk-artifact-prune.sh \
             tests/needs-full-macos.sh \
             scripts/needs-full-macos \

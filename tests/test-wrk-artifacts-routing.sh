@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the three wrk artifacts subcommands route through the single shared
+# Verify the four wrk artifacts subcommands route through the single shared
 # command/help definitions. All command state and files stay in a temp root.
 set -euo pipefail
 export WRK_TEST_MODE=1
@@ -71,5 +71,8 @@ mkdir -p "$TMP/source" "$TMP/drive" "$TMP/drivefs-logs"
 "$WRK" artifacts move "$TMP/source" --dest "$TMP/drive/fixture/dataset" --help \
   >"$TMP/move-help" || fail "move route failed"
 grep -q '^Usage: wrk artifacts move ' "$TMP/move-help" || fail "move subcommand was not reached"
+
+"$WRK" artifacts sweep --help >"$TMP/sweep-help" || fail "sweep route failed"
+grep -q '^Usage: wrk artifacts sweep ' "$TMP/sweep-help" || fail "sweep subcommand was not reached"
 
 echo "PASS test-wrk-artifacts-routing"
