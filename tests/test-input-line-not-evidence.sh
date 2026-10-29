@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #646: builder's follow-up injection section says what decides a suspected
+# #646: the follow-up injection section (ops/references/relay.md §3-3) says what decides a suspected
 # unsubmitted prompt — the delivery row and the receiver's transcript, not
 # text on the input line — before any resend or Enter. Mutants: the bullet
 # removed, its verdict inverted, the resend/Enter ordering dropped, the
@@ -16,16 +16,16 @@ import re
 import sys
 
 root = Path(sys.argv[1])
-builder_path = Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md"))
-text = builder_path.read_text(encoding="utf-8")
+relay_path = Path(os.environ.get("RELAY_DOC", root / "ops/references/relay.md"))
+text = relay_path.read_text(encoding="utf-8")
 
-HEADING = "## 후속 라운드·보충 지시의 주입"
+HEADING = "### 3-3. 후속 라운드·보충 지시의 주입"
 
 
 def section(doc: str) -> str:
     assert HEADING in doc, f"missing heading: {HEADING}"
     body = doc.split(HEADING, 1)[1]
-    m = re.search(r"(?m)^## ", body)
+    m = re.search(r"(?m)^##? ", body)
     return re.sub(r"\s+", " ", body[: m.start()] if m else body)
 
 

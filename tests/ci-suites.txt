@@ -27,6 +27,7 @@ suites-b|bash tests/test-untagged-operator-evidence.sh
 suites-b|bash tests/test-event-monitor-doc.sh
 suites-b|bash tests/test-decision-request-doc.sh
 suites-b|bash tests/test-input-line-not-evidence.sh
+suites-b|bash tests/test-ops-wake-contract.sh
 suites-b|bash tests/test-tester-family-policy.sh
 suites-b|bash tests/test-ci-canonical-prose.sh
 suites-b|bash tests/test-assignment-defaults.sh

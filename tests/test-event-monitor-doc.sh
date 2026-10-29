@@ -4,16 +4,16 @@
 # A director session accumulated 256 session-bound polling monitors over 96h
 # and lost 34 of them in one reboot (hk:doc
 # task/2026-09-24/director-monitors-to-panewire). The fix is contract text:
-# director/SKILL.md bans per-job polling loops and binds the allowed signals
-# to the deployed-build event table; builder/SKILL.md makes spawned builders
-# idle-wait on pushed events instead of re-checking every turn. This guard:
+# ops/references/watching.md bans per-job polling loops and binds the allowed
+# signals to the deployed-build event table, and makes a spawner idle-wait on
+# pushed events instead of re-checking every turn. This guard:
 #
-#   1. director §감시 정책 carries the ban, the event-subscription rule, the
+#   1. watching.md §감시 정책 carries the ban, the event-subscription rule, the
 #      missing-event -> task rule, a numeric concurrency cap with its
 #      rationale, and a pointer to the event table;
-#   2. builder carries the idle-until-event rule, the per-turn re-check ban,
+#   2. watching.md §스폰 후 대기 carries the idle-until-event rule, the per-turn re-check ban,
 #      and the single blocking-wait exception;
-#   3. director/panewire-events.md keeps all four categories and marks
+#   3. ops/references/panewire-events.md keeps all four categories and marks
 #      deployed-only "있음" separately from source-only "미배포";
 #   4. mutants (wording or table rows removed) go RED through an assertion.
 set -euo pipefail
@@ -26,12 +26,12 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-director_path = Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md"))
-builder_path = Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md"))
-events_path = Path(os.environ.get("EVENTS_DOC", root / "director/panewire-events.md"))
+policy_path = Path(os.environ.get("WATCHING_DOC", root / "ops/references/watching.md"))
+wait_path = policy_path
+events_path = Path(os.environ.get("EVENTS_DOC", root / "ops/references/panewire-events.md"))
 
-director_text = director_path.read_text(encoding="utf-8")
-builder_text = builder_path.read_text(encoding="utf-8")
+policy_text = policy_path.read_text(encoding="utf-8")
+wait_text = wait_path.read_text(encoding="utf-8")
 events_text = events_path.read_text(encoding="utf-8")
 
 
@@ -48,7 +48,7 @@ def section(text: str, heading: str) -> str:
     return body[: m.start()] if m else body
 
 
-def check_director(text: str) -> None:
+def check_policy(text: str) -> None:
     """§감시 정책 must ban per-job polling loops, route to event subscription,
     escalate missing events to tasks, and carry a numeric cap with rationale."""
     sec = flat(section(text, "## 감시 정책"))
@@ -92,10 +92,10 @@ def check_director(text: str) -> None:
     )
 
 
-def check_builder(text: str) -> None:
+def check_wait(text: str) -> None:
     """Builder must idle after spawning, wake on pushed events, never re-check
     per turn, and get exactly one blocking wait."""
-    sec = flat(section(text, "### 스폰 후 대기"))
+    sec = flat(section(text, "## 스폰 후 대기"))
     assert re.search(r"유휴로 대기하고.{0,40}알림으로 깨어난다", sec), (
         "idle-until-completion-notification rule missing"
     )
@@ -108,9 +108,9 @@ def check_builder(text: str) -> None:
     assert "bounded timeout" in sec, (
         "the blocking wait must be bounded (timeout required)"
     )
-    assert "panewire-events.md" in sec, "builder must point at the event table"
+    assert "panewire-events.md" in sec, "spawn-wait must point at the event table"
     assert "공백 신호" in sec, (
-        "builder must point at the director gap-signal rule for undeployed signals"
+        "spawn-wait must point at the gap-signal rule for undeployed signals"
     )
 
 
@@ -164,11 +164,11 @@ def check_events_doc(text: str) -> None:
     )
 
 
-check_director(director_text)
-print("PASS director ban=1 subscribe=1 missing->task=1 cap=3 rationale=1 doc-ptr=1")
+check_policy(policy_text)
+print("PASS watching.md policy ban=1 subscribe=1 missing->task=1 cap=3 rationale=1 doc-ptr=1")
 
-check_builder(builder_text)
-print("PASS builder idle-wait=1 no-per-turn-recheck=1 blocking-wait-1=1 doc-ptr=1")
+check_wait(wait_text)
+print("PASS watching.md spawn-wait idle-wait=1 no-per-turn-recheck=1 blocking-wait-1=1 doc-ptr=1")
 
 check_events_doc(events_text)
 print("PASS events-doc categories=4/4 pins=2 deployed/source-split=1 ci-conclusion=1")
@@ -186,30 +186,30 @@ def expect_assertion(label, callback):
     raise AssertionError(f"{label} mutant did not go RED")
 
 
-director_section_removed = re.sub(
-    r"(?s)## 감시 정책.*?(?=\n## |\Z)", "", director_text, count=1
+policy_section_removed = re.sub(
+    r"(?s)## 감시 정책.*?(?=\n## |\Z)", "", policy_text, count=1
 )
-assert director_section_removed != director_text, (
-    "fixture: director 감시 정책 section not found to remove"
-)
-
-director_cap_removed = director_text.replace("동시 3개 이하", "동시 적당히", 1)
-assert director_cap_removed != director_text, (
-    "fixture: director cap number not found to weaken"
+assert policy_section_removed != policy_text, (
+    "fixture: policy 감시 정책 section not found to remove"
 )
 
-director_task_rule_removed = re.sub(
-    r"(?s)\*\*부족한 이벤트는.*?\n\n", "\n", director_text, count=1
-)
-assert director_task_rule_removed != director_text, (
-    "fixture: director missing-event->task bullet not found"
+policy_cap_removed = policy_text.replace("동시 3개 이하", "동시 적당히", 1)
+assert policy_cap_removed != policy_text, (
+    "fixture: policy cap number not found to weaken"
 )
 
-builder_section_removed = re.sub(
-    r"(?s)### 스폰 후 대기.*?(?=\n### |\n## |\Z)", "", builder_text, count=1
+policy_task_rule_removed = re.sub(
+    r"(?s)\*\*부족한 이벤트는.*?\n\n", "\n", policy_text, count=1
 )
-assert builder_section_removed != builder_text, (
-    "fixture: builder 대기 section not found to remove"
+assert policy_task_rule_removed != policy_text, (
+    "fixture: policy missing-event->task bullet not found"
+)
+
+wait_section_removed = re.sub(
+    r"(?s)## 스폰 후 대기.*?(?=\n## |\Z)", "", wait_text, count=1
+)
+assert wait_section_removed != wait_text, (
+    "fixture: wait 대기 section not found to remove"
 )
 
 events_deployed_split_removed = events_text.replace("미배포", "있음")
@@ -248,55 +248,55 @@ assert events_conclusion_removed != events_text, (
     "fixture: events doc §5 conclusion not found to remove"
 )
 
-director_gap_rule_removed = re.sub(
-    r"(?s)- \*\*공백 신호는.*?(?=\n- )", "", director_text, count=1
+policy_gap_rule_removed = re.sub(
+    r"(?s)- \*\*공백 신호는.*?(?=\n- )", "", policy_text, count=1
 )
-assert director_gap_rule_removed != director_text, (
-    "fixture: director gap-signal bullet not found to remove"
+assert policy_gap_rule_removed != policy_text, (
+    "fixture: policy gap-signal bullet not found to remove"
 )
 
-director_rationale_removed = director_text.replace(
+policy_rationale_removed = policy_text.replace(
     "실측 96h에 256건", "관측된 사례", 1
 )
-assert director_rationale_removed != director_text, (
-    "fixture: director 256건 rationale not found to remove"
+assert policy_rationale_removed != policy_text, (
+    "fixture: policy 256건 rationale not found to remove"
 )
 
-builder_bounded_removed = builder_text.replace(
+wait_bounded_removed = wait_text.replace(
     "**bounded timeout 있는 블로킹 명령 1개**", "블로킹 명령 1개", 1
 )
-assert builder_bounded_removed != builder_text, (
-    "fixture: builder bounded-timeout wording not found to remove"
+assert wait_bounded_removed != wait_text, (
+    "fixture: wait bounded-timeout wording not found to remove"
 )
 
 # 처방 수단·판정 기준 약화 — 문구가 남아도 의미가 무너지면 RED 여야 한다.
-director_gap_local_lost = director_text.replace(
+policy_gap_local_lost = policy_text.replace(
     "로컬 herdr 소켓 1대분", "fleet 조회", 1
 )
-assert director_gap_local_lost != director_text, (
-    "fixture: director herdr local-scope wording not found"
+assert policy_gap_local_lost != policy_text, (
+    "fixture: policy herdr local-scope wording not found"
 )
 
-director_gap_remote_lost = director_text.replace(
+policy_gap_remote_lost = policy_text.replace(
     "`ssh <host> herdr agent list`", "", 1
 )
-assert director_gap_remote_lost != director_text, (
-    "fixture: director ssh fallback wording not found"
+assert policy_gap_remote_lost != policy_text, (
+    "fixture: policy ssh fallback wording not found"
 )
 
-director_gap_judgement_lost = director_text.replace("**판정 기준:**", "", 1)
-assert director_gap_judgement_lost != director_text, (
-    "fixture: director judgement-criteria wording not found"
+policy_gap_judgement_lost = policy_text.replace("**판정 기준:**", "", 1)
+assert policy_gap_judgement_lost != policy_text, (
+    "fixture: policy judgement-criteria wording not found"
 )
 
-director_stall_basis_lied = director_text.replace("pane read", "revision")
-assert director_stall_basis_lied != director_text, (
-    "fixture: director pane-read basis not found"
+policy_stall_basis_lied = policy_text.replace("pane read", "revision")
+assert policy_stall_basis_lied != policy_text, (
+    "fixture: policy pane-read basis not found"
 )
 
-builder_gap_pointer_lost = builder_text.replace('"공백 신호" 규칙', "규칙", 1)
-assert builder_gap_pointer_lost != builder_text, (
-    "fixture: builder gap-signal pointer not found"
+wait_gap_pointer_lost = wait_text.replace('"공백 신호" 규칙', "규칙", 1)
+assert wait_gap_pointer_lost != wait_text, (
+    "fixture: wait gap-signal pointer not found"
 )
 
 hub_row = next(
@@ -331,24 +331,24 @@ assert events_spawned_row_flipped != events_text, (
 )
 
 mutants = [
-    ("director-section-removed", lambda: check_director(director_section_removed)),
-    ("director-cap-weakened", lambda: check_director(director_cap_removed)),
+    ("policy-section-removed", lambda: check_policy(policy_section_removed)),
+    ("policy-cap-weakened", lambda: check_policy(policy_cap_removed)),
     (
-        "director-missing-event-task-rule-removed",
-        lambda: check_director(director_task_rule_removed),
+        "policy-missing-event-task-rule-removed",
+        lambda: check_policy(policy_task_rule_removed),
     ),
     (
-        "director-gap-signal-rule-removed",
-        lambda: check_director(director_gap_rule_removed),
+        "policy-gap-signal-rule-removed",
+        lambda: check_policy(policy_gap_rule_removed),
     ),
     (
-        "director-cap-rationale-removed",
-        lambda: check_director(director_rationale_removed),
+        "policy-cap-rationale-removed",
+        lambda: check_policy(policy_rationale_removed),
     ),
-    ("builder-section-removed", lambda: check_builder(builder_section_removed)),
+    ("wait-section-removed", lambda: check_wait(wait_section_removed)),
     (
-        "builder-bounded-timeout-removed",
-        lambda: check_builder(builder_bounded_removed),
+        "wait-bounded-timeout-removed",
+        lambda: check_wait(wait_bounded_removed),
     ),
     (
         "events-deployed-source-split-removed",
@@ -368,24 +368,24 @@ mutants = [
         lambda: check_events_doc(events_conclusion_removed),
     ),
     (
-        "director-gap-local-scope-lied",
-        lambda: check_director(director_gap_local_lost),
+        "policy-gap-local-scope-lied",
+        lambda: check_policy(policy_gap_local_lost),
     ),
     (
-        "director-gap-remote-means-removed",
-        lambda: check_director(director_gap_remote_lost),
+        "policy-gap-remote-means-removed",
+        lambda: check_policy(policy_gap_remote_lost),
     ),
     (
-        "director-gap-judgement-removed",
-        lambda: check_director(director_gap_judgement_lost),
+        "policy-gap-judgement-removed",
+        lambda: check_policy(policy_gap_judgement_lost),
     ),
     (
-        "director-stall-basis-lied",
-        lambda: check_director(director_stall_basis_lied),
+        "policy-stall-basis-lied",
+        lambda: check_policy(policy_stall_basis_lied),
     ),
     (
-        "builder-gap-pointer-removed",
-        lambda: check_builder(builder_gap_pointer_lost),
+        "wait-gap-pointer-removed",
+        lambda: check_wait(wait_gap_pointer_lost),
     ),
     (
         "events-hub-row-removed",

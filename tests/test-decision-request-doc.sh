@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# #618 AC5: director/SKILL.md must keep the decision-request contract
+# #618 AC5: ops/references/decision-request.md must keep the decision-request contract
 # (hk:doc task/2026-09-24/console-req-1 수정 AC A2·A3·A6·A7):
 #
 #   1. the CLI line `handoffkeep tasks decision-request` with the separate
@@ -20,8 +20,8 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-director_path = Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md"))
-director_text = director_path.read_text(encoding="utf-8")
+doc_path = Path(os.environ.get("DECISION_REQUEST_DOC", root / "ops/references/decision-request.md"))
+doc_text = doc_path.read_text(encoding="utf-8")
 
 HEADING = "## 운영자 결정 요청"
 
@@ -70,7 +70,7 @@ def check(text: str) -> None:
     assert re.search(r"NOT recorded.{0,80}통지하지 않는다", sec), "no console-visibility claim on a failed record (A6)"
     # M2 (#48): an unconfirmable write is UNKNOWN — check tasks show before
     # notifying, and claim neither recorded nor not recorded.
-    assert re.search(r"UNKNOWN.{0,200}handoffkeep tasks show", sec), "UNKNOWN outcome must send the director to tasks show first"
+    assert re.search(r"UNKNOWN.{0,200}handoffkeep tasks show", sec), "UNKNOWN outcome must send the requester to tasks show first"
     assert re.search(r"알리기 전에.{0,120}tasks show", sec), "tasks show must come before any notification"
     assert re.search(r"\"기록됐다\"도\s*\"기록 안 됐다\"도 말하지 않는다", sec), "UNKNOWN must forbid both recorded and not-recorded claims"
     assert re.search(r"권고와 무응답 동작은 별개", sec), "recommendation/default separation missing (A2)"
@@ -90,26 +90,26 @@ def expect_assertion(label, callback):
     raise AssertionError(f"{label} mutant did not go RED")
 
 
-check(director_text)
-print("PASS director decision-request contract")
+check(doc_text)
+print("PASS decision-request.md contract")
 
 mutants = [
-    ("cli-line-removed", director_text.replace("handoffkeep tasks decision-request", "handoffkeep tasks transition")),
-    ("human-only-cli-flag-removed", director_text.replace("[--block] [--human-only]", "[--block]", 1)),
-    ("human-only-rule-removed", re.sub(r"(?m)^- Any `decision-request` about merge,.*\n", "", director_text, count=1)),
-    ("operator-decided-provenance-removed", re.sub(r"(?m)^- GPT Dots may answer a `human_only` request.*\n", "", director_text, count=1)),
-    ("record-first-removed", director_text.replace("기록 먼저, 알림에 request_id", "알림")),
-    ("failed-record-claim", director_text.replace("통지하지 않는다", "통지한다")),
-    ("default-merged-into-recommendation", director_text.replace("권고와 무응답 동작은 별개다", "권고가 곧 기본값이다")),
-    ("deadline-means-applied", director_text.replace("기한 경과는 적용이 아니다", "기한이 지나면 적용된 것으로 본다")),
-    ("label-120-chars", director_text.replace("120바이트**(한글 120자가 아니다", "120자**(")),
-    ("section-removed", director_text.replace(HEADING, "## 기타")),
-    ("unknown-line-removed", re.sub(r"(?m)^- \*\*결과 미확인.*?(?=^- \*\*권고와)", "", director_text, flags=re.S)),
-    ("unknown-claims-not-recorded", director_text.replace("\"기록됐다\"도\n  \"기록 안 됐다\"도 말하지 않는다", "\"기록 안 됐다\"고 알린다")),
-    ("unknown-notify-first", director_text.replace("누구에게도 알리기 전에", "알린 뒤에")),
+    ("cli-line-removed", doc_text.replace("handoffkeep tasks decision-request", "handoffkeep tasks transition")),
+    ("human-only-cli-flag-removed", doc_text.replace("[--block] [--human-only]", "[--block]", 1)),
+    ("human-only-rule-removed", re.sub(r"(?m)^- Any `decision-request` about merge,.*\n", "", doc_text, count=1)),
+    ("operator-decided-provenance-removed", re.sub(r"(?m)^- GPT Dots may answer a `human_only` request.*\n", "", doc_text, count=1)),
+    ("record-first-removed", doc_text.replace("기록 먼저, 알림에 request_id", "알림")),
+    ("failed-record-claim", doc_text.replace("통지하지 않는다", "통지한다")),
+    ("default-merged-into-recommendation", doc_text.replace("권고와 무응답 동작은 별개다", "권고가 곧 기본값이다")),
+    ("deadline-means-applied", doc_text.replace("기한 경과는 적용이 아니다", "기한이 지나면 적용된 것으로 본다")),
+    ("label-120-chars", doc_text.replace("120바이트**(한글 120자가 아니다", "120자**(")),
+    ("section-removed", doc_text.replace(HEADING, "## 기타")),
+    ("unknown-line-removed", re.sub(r"(?m)^- \*\*결과 미확인.*?(?=^- \*\*권고와)", "", doc_text, flags=re.S)),
+    ("unknown-claims-not-recorded", doc_text.replace("\"기록됐다\"도\n  \"기록 안 됐다\"도 말하지 않는다", "\"기록 안 됐다\"고 알린다")),
+    ("unknown-notify-first", doc_text.replace("누구에게도 알리기 전에", "알린 뒤에")),
 ]
 for label, text in mutants:
-    assert text != director_text, f"{label} mutant did not change the text"
+    assert text != doc_text, f"{label} mutant did not change the text"
     expect_assertion(label, lambda t=text: check(t))
 print(f"PASS mutants assertion-red={len(mutants)}/{len(mutants)}")
 PY

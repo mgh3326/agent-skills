@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Deploy record contract (#528): the installer's last step writes one
 # append-only deploy record on every path (success, failure, escalation).
+# The contract lives in ops/references/deploy.md (+ deploy-checklist.md).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,13 +13,10 @@ import sys
 
 root = Path(sys.argv[1])
 installer_text = Path(
-    os.environ.get("INSTALLER_SKILL", root / "installer/SKILL.md")
+    os.environ.get("INSTALLER_SKILL", root / "ops/references/deploy.md")
 ).read_text(encoding="utf-8")
 checklist_text = Path(
-    os.environ.get("INSTALLER_CHECKLIST", root / "installer/CHECKLIST.md")
-).read_text(encoding="utf-8")
-director_text = Path(
-    os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md")
+    os.environ.get("INSTALLER_CHECKLIST", root / "ops/references/deploy-checklist.md")
 ).read_text(encoding="utf-8")
 
 
@@ -165,21 +163,21 @@ def check_checklist(text: str) -> None:
     assert "9a. 본문 필드 13개 전부(모르는 값 `null`, 추측 0)" in sec, "checklist field count drifted"
 
 
-def check_director(text: str) -> None:
-    deploy = flat(section(text, "## 배포"))
+def check_orderer(text: str) -> None:
+    deploy = flat(section(text, "## 발주자 측 — operator-desk"))
     assert "생긴 것을 확인하기 전에는 installer 세션을 회수하지 않는다" in deploy, (
-        "director may reap installer before the record exists"
+        "the orderer may reap installer before the record exists"
     )
     assert "기존 `deploy/` 키는 덮어쓰지 않는다" in deploy
-    assert "기록 키는 installer 스폰 입력으로 director가 정한다(시각 = 스폰 시각, UTC `YYYYMMDDTHHMMSSZ`)" in deploy
+    assert "기록 키는 installer 스폰 입력으로 operator-desk가 정한다(시각 = 스폰 시각, UTC `YYYYMMDDTHHMMSSZ`)" in deploy
 
 
 check_installer(installer_text)
 print(f"PASS installer deploy-record step=9/last fields={len(FIELDS)} triggers=8")
 check_checklist(checklist_text)
 print("PASS checklist step 9 items=5")
-check_director(director_text)
-print("PASS director reap-after-record")
+check_orderer(installer_text)
+print("PASS orderer reap-after-record")
 
 
 def expect_assertion(label, callback):
@@ -251,9 +249,9 @@ checklist_mutants = [
     )),
     ("checklist-absence-item-removed", re.sub(r"(?m)^- \[ \] 9b\. .*\n", "", checklist_text, count=1)),
 ]
-director_mutants = [
-    ("director-reaps-before-record", mutate(
-        director_text, "생긴 것을 확인하기 전에는 installer 세션을 회수하지 않는다", "기다리지 않고 installer 세션을 회수한다",
+orderer_mutants = [
+    ("orderer-reaps-before-record", mutate(
+        installer_text, "생긴 것을 확인하기 전에는 installer 세션을 회수하지 않는다", "기다리지 않고 installer 세션을 회수한다",
     )),
 ]
 
@@ -263,8 +261,8 @@ for label, text in installer_mutants:
 for label, text in checklist_mutants:
     assert text != checklist_text, f"fixture: {label} did not change the text"
     expect_assertion(label, lambda text=text: check_checklist(text))
-for label, text in director_mutants:
-    expect_assertion(label, lambda text=text: check_director(text))
-total = len(installer_mutants) + len(checklist_mutants) + len(director_mutants)
+for label, text in orderer_mutants:
+    expect_assertion(label, lambda text=text: check_orderer(text))
+total = len(installer_mutants) + len(checklist_mutants) + len(orderer_mutants)
 print(f"PASS mutants assertion-red={total}/{total}")
 PY
