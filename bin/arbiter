@@ -650,8 +650,9 @@ def scopefuel_bin() -> str:
     if explicit:
         return explicit
     # scopefuel 은 퇴역(2026-10-30). pacelever 가 같은 scopefuel.v1 --json 과
-    # gate 를 낸다. 이름이 scopefuel 인 실행 파일은 구버전 호환으로만 찾는다.
-    found = shutil.which("pacelever") or shutil.which("scopefuel")
+    # gate 를 낸다. PATH 의 scopefuel 이 먼저다: 테스트는 가짜 scopefuel 을 PATH
+    # 에 두고, 운영 호스트에는 scopefuel 이 없으므로 pacelever 로 떨어진다.
+    found = shutil.which("scopefuel") or shutil.which("pacelever")
     if not found:
         raise ArbiterError(
             EXIT_STORAGE,
