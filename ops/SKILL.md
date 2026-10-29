@@ -32,7 +32,7 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
 - **Isolated HOME/XDG is for test and probe runs only.** Spawn, placement and delivery
   commands (`pacelever`, `runtug spawn|done|escalate`, `panewire`) use the real HOME.
 - **A test harness that does a real spawn stops its completion watchers before removing
-  its temp root** (`tests/lib/tmp-writers.sh` `tmp_writers_stop`); signal only pids it started.
+  its temp root**; signal only pids it started.
 - **On macOS hosts run Go suites with `go test -p 2`** — wider parallelism stalls in syspolicyd.
 
 ## Routing table
