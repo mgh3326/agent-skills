@@ -212,9 +212,10 @@ echo "PASS grok generic fallback runs $CONTRACT_GROK_MODEL_ID"
 while IFS='|' read -r agy_profile agy_expected; do
   [[ -n "$agy_profile" ]] || continue
   agy_argv="$(spawn_argv "$agy_profile")"
-  grep -qF -- 'agent start ' <<<"$agy_argv" &&
-    grep -qF -- '--kind agy ' <<<"$agy_argv" ||
+  if ! grep -qF -- 'agent start ' <<<"$agy_argv" ||
+    ! grep -qF -- '--kind agy ' <<<"$agy_argv"; then
     fail "profile '$agy_profile' did not start the agy harness: $agy_argv"
+  fi
   grep -qF -- "$agy_expected" <<<"$agy_argv" ||
     fail "profile '$agy_profile': expected argv to contain '$agy_expected'; got: $agy_argv"
   if grep -qF -- '--effort' <<<"$agy_argv"; then
