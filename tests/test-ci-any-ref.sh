@@ -411,7 +411,7 @@ git -C "$tmp/co" merge -qm mutant "$SHA_B" >/dev/null
 # shellcheck disable=SC2016  # single-quoted grep pattern is intentional
 ctx_line="$(grep -oF 'if [[ "$SUITE" == all ]]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-$SUITE"; fi' "$root/.github/workflows/ci-any-ref.yml")"
 [[ -n "$ctx_line" ]]
-for suite in all lint macos-smoke wrk suites-a suites-b python; do
+for suite in all lint macos-smoke suites-a suites-b python; do
   CONTEXT="$(SUITE="$suite" bash -c "$ctx_line; printf '%s' \"\$CONTEXT\"")"
   if [[ "$suite" == all ]]; then
     [[ "$CONTEXT" == ci-ok ]]

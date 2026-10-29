@@ -35,7 +35,6 @@ make_repo() {
   mkdir -p "$repo/docs"   # no SKILL.md: never linked
   printf '#!/bin/sh\n' >"$repo/bin/tool-keep"
   printf '#!/bin/sh\n' >"$repo/bin/tool-gone"
-  printf '#!/bin/sh\n# PROFILE_KIND=claude\n' >"$repo/bin/wrk"
   chmod +x "$repo/bin/"*
 }
 
