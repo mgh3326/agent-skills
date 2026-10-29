@@ -4,7 +4,7 @@
 # A Claude Code prompt suggestion phrased as an operator confirmation was
 # submitted in a tester pane, and the tester flipped its verdict to PASS on it
 # (hk:doc task/2026-09-24/phantom-suggestion-submitted). This guard, in the
-# shape of the retired openai-independent-gate prose test:
+# shape of the retired openai-independent-gate prose test (removed with the skills):
 #
 #   1. the contract block occurs once in wake/SKILL.md (§Operator confirmation
 #      provenance) and equals the canonical text below;

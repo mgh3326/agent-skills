@@ -154,8 +154,9 @@ All must hold for head `$H`:
   gh api graphql --paginate -F o=<owner> -F r=<repo> -F n=<n> -f query='query($o:String!,$r:String!,$n:Int!,$endCursor:String){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{isResolved path comments(first:1){nodes{body}}}}}}}' \
     --jq '.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved|not)'
   ```
-- The mergewake review completed. Its reviewer family differs from the author family
-  (`--author-family`; mergewake enforces it). On a PR touching any `blocking[].paths` entry,
+- The mergewake review completed. mergewake picks the reviewer from `--author-family` and
+  records `same_family` on each pass; a same-family pass is still the one review, and the
+  worker's report says so. On a PR touching any `blocking[].paths` entry,
   that one `mergewake review --apply` posts two passes (correctness lens, then state-risk
   lens); both must be posted. Done marker:
   `gh api repos/<owner>/<repo>/git/matching-refs/mergewake/reviews/<n>/ --jq '.[].ref'`

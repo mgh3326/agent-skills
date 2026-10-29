@@ -67,7 +67,7 @@ REQUIRED = [
     # Subagents.
     ("wake", "## Subagent vs worker", "t2-worker", r"\*\*T2 and above always\*\*"),
     # Merge gate additions.
-    ("wake", "## Merge gate", "reviewer-family", r"reviewer family differs from the author family"),
+    ("wake", "## Merge gate", "reviewer-family", r"mergewake picks the reviewer from `--author-family` and records `same_family` on each pass"),
     ("wake", "## Merge gate", "base-freshness", r"\*\*Base freshness:\*\* `git merge-base --is-ancestor origin/<base> \"\$H\"`"),
     ("wake", "## Merge gate", "merge-not-rebase", r"never rebase or force-push a pushed branch"),
     ("wake", "## Merge gate", "leak-scan", r"\*\*Public repo leak scan\*\* of the diff: no secrets"),
@@ -187,14 +187,24 @@ def expect_red(label: str, d: dict, ref_texts: dict) -> None:
 
 
 count = 0
-# One deletion mutant per required row: remove the matched text (any wrapping).
+def section_span(text: str, heading: str) -> tuple:
+    """(start, end) offsets of section() inside text."""
+    if not heading:
+        return 0, len(text)
+    start = text.index(heading) + len(heading)
+    return start, start + len(section(text, heading))
+
+
+# One deletion mutant per required row: remove the matched text (any wrapping)
+# inside that row's own section, so the mutant proves this row is guarded and
+# not a copy of the same sentence elsewhere.
 for doc, heading, row, pattern in REQUIRED:
     text = docs[doc]
-    scope = section(text, heading) if heading else text
-    m = re.search(pattern, flat(scope))
+    start, end = section_span(text, heading)
+    m = re.search(pattern, flat(text[start:end]))
     words = m.group(0).split()
-    raw = re.search(r"\s+".join(re.escape(w) for w in words), text)
-    assert raw, f"fixture: row {row} not found unflattened"
+    raw = re.compile(r"\s+".join(re.escape(w) for w in words)).search(text, start, end)
+    assert raw, f"fixture: row {row} not found unflattened in its section"
     mutated = dict(docs)
     mutated[doc] = text[: raw.start()] + text[raw.end():]
     expect_red(f"row-{row}-deleted", mutated, refs)

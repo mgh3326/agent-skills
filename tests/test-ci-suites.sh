@@ -5,6 +5,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$root" <<'PY'
 from collections import Counter
 import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -73,5 +74,25 @@ for pattern in paths:
     matches = list(root.glob(pattern))
     assert matches and all(path.exists() for path in matches), f"Darwin-sensitive path/glob does not exist: {pattern}"
 
-print(f"PASS ci-suites commands={len(commands)} shards=4 smoke={len(smoke_commands)} darwin_paths={len(paths)}")
+# director/gate_policy.json pins ci.yml (and other trust-bearing files) by
+# sha256; a PR that edits a pinned file must re-hash it in the same commit.
+# Duplicate keys anywhere would let a lenient reader see a stale value.
+def no_duplicates(pairs):
+    keys = [key for key, _value in pairs]
+    dupes = sorted({key for key in keys if keys.count(key) > 1})
+    assert not dupes, f"gate_policy.json has duplicate keys: {dupes}"
+    return dict(pairs)
+
+
+policy = json.loads((root / "director/gate_policy.json").read_text(encoding="utf-8"), object_pairs_hook=no_duplicates)
+pins = policy["local_sources"]
+assert ".github/workflows/ci.yml" in pins, "gate_policy local_sources must pin .github/workflows/ci.yml"
+for rel, pinned in pins.items():
+    target = (root / rel).resolve()
+    assert not Path(rel).is_absolute() and root.resolve() in target.parents, f"pin outside the repo: {rel}"
+    assert target.is_file(), f"pinned file is missing: {rel}"
+    actual = hashlib.sha256(target.read_bytes()).hexdigest()
+    assert pinned == actual, f"stale gate_policy pin for {rel}: pinned {str(pinned)[:12]}… actual {actual[:12]}…"
+
+print(f"PASS ci-suites commands={len(commands)} shards=4 smoke={len(smoke_commands)} darwin_paths={len(paths)} pins={len(pins)}")
 PY
