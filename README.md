@@ -57,7 +57,6 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 
 | 스킬 | 용도 |
 |---|---|
-| `orchestrate` | 완성된 설계·운영자 결정을 받아 워커 스폰~완료 검증까지 전체 루프 구동 — spawn-worker 위층 진입점 |
 | `relay-handoff` | 세션 간 작업·분석·지시 전달 — 핸드오프 5요소 템플릿 + herdr 주입·제출검증 |
 | `spawn-worker` | 워커/tester 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
 | `director` | 운영자 직속 최상위 역할 — 머지·배포·큐 권한, 빌더 브리프·스폰·독립 검증 판정 |
@@ -65,15 +64,14 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `builder` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
 | `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
-| `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
 | `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음 |
 
 구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
 
-스킬 간 관계: `orchestrate`(설계+결정 → 루프 전체 구동) 는 `spawn-worker`(스폰 기계학)를
-호출한다. `relay-handoff`(단방향 전달) ⊂ `ask-session`(답변 계약 붙은 왕복) ⊂
-`consult-advisor`(자문처 해석+headless 폴백). `spawn-worker`는 주입 단계에서 relay-handoff를
+스킬 간 관계: `spawn-worker`는 설계에서 완료 검증·회수까지 실행 루프를 담당한다.
+`relay-handoff`는 단방향 전달과 답변 파일 계약이 붙은 왕복 질의를 담당하며,
+`consult-advisor`는 자문처 해석과 headless 폴백을 추가한다. `spawn-worker`는 주입 단계에서 relay-handoff를
 참조. **대상 세션 부재 시 공통 규칙: 자동 재생성 없음 — 실패 보고 + 운영자 에스컬레이션**
 (orch/빌더 재생성은 운영자 결정; 새 세션은 같은 cwd `claude --continue`+메모리+Linear+inbox로
 상태 복원).

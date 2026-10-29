@@ -1,9 +1,4 @@
----
-name: ask-session
-description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보내고 답변을 회수하는 왕복 절차. 진행 결과 질의, 판단 요청, 현황 보고 요청에 사용. 트리거 - "orch에 물어봐", "확인해서 답 받아와", "세션에 질의하고 결과 가져와", 다른 세션의 작업 결과 회수.
----
-
-# ask-session — 세션 질의·답변 회수 왕복
+# 세션 질의 — 세션 질의·답변 회수 왕복
 
 **`comms-contract: v1`** (정본 = `relay-handoff` §3-1).
 🔴 **질의 패킷 머리에 이 줄을 그대로 옮겨 적는다.** 답변자는 이 판을 보고 통지 방식을 정한다 —
@@ -28,7 +23,7 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
   claude 기본 통지와 비-claude 대체 통지를 함께 적는다:
 
   ```bash
-  herdr agent prompt <pane>
+  herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
 - 머리에: `(같은 질문이 두 번 보이면 재답변 금지)`.
 
@@ -53,7 +48,7 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
   비-claude 수신자용 대체 통지는 그 정본에 따라 아래 직접 주입을 사용한다:
 
   ```bash
-  herdr agent prompt <pane>
+  herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
 - 이벤트 수신 또는 비-claude 기한 확인 뒤 파일이 없으면 ①`herdr agent read <target> --lines 40`으로
   답변이 화면에만 있는지 확인 — 있으면 "파일 미작성, 화면 전사본" 명시 ②없으면
@@ -77,5 +72,5 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
 
 - 답변 채널이 파일인 이유: 세션 pane에 send로 회신하면 사용자 타이핑과 충돌(실사고),
   화면 출력은 스크롤/compact로 유실된다. 인박스 파일은 durable하고 어느 에이전트든 읽는다.
-- 이 스킬은 relay-handoff(단방향 전달)의 왕복 확장이다 — 질의도 결국 "답변 계약이 붙은
+- 이 절차는 relay-handoff의 왕복 확장이다 — 질의도 결국 "답변 계약이 붙은
   릴레이"다.

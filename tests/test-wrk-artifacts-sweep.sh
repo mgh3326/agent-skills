@@ -202,6 +202,7 @@ print(json.load(sys.stdin)["body"])'
 # rc into SWEEP_RC. Extra env pairs may precede the wrk args as NAME=VALUE.
 sweep() {
   local out="" rc=0
+  # Bash 3.2 treats an empty array as unset under nounset.
   local -a envs=()
   while [[ "${1:-}" == *=* ]]; do envs+=("$1"); shift; done
   out="$(env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
@@ -209,7 +210,7 @@ sweep() {
     HK_DOC_PUT_OK=1 SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
     WRK_HOSTS_CONFIG="$HOSTS" WRK_FIXTURE_LOG="$HERDR_LOG" \
     WRK_FIXTURE_GET_SEQUENCE="$GET_SEQ" \
-    HOME="$TMPHOME" TMPDIR="$TMP" "${envs[@]}" \
+    HOME="$TMPHOME" TMPDIR="$TMP" ${envs[@]+"${envs[@]}"} \
     "$WRK" artifacts sweep --policy "$POLICY" "$@" 2>&1)" || rc=$?
   SWEEP_RC=$rc; SWEEP_OUT="$out"
   printf '%s\n' "$out"
