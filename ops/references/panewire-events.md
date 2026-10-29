@@ -13,7 +13,7 @@
 |---|---|---|
 | 허브 (ncp) | `pw-e401923` (#64, 09-17 머지) | hk:doc `deploy/panewire-hub/20260923T033051Z` — director-1 의 09-23 NCP 실측(서비스 ExecStart 바이너리 `panewire version`, 기동 후 교체 없음). 허브 배포는 BLOCK-3 에 묶여 옛 판 |
 | 노드 (desktop) | `pw-05667f4` (#57, 09-14 머지) | 설치본 `panewire version` = `pw-05667f4` · 실행 중 데몬 argv 실측(`--inbox-root` 가 있고 `--hub-jobs-root`·`--checks-config`·`--stall-detect*` 없음 — jobsInboxRoot 는 inbox-root 기본값, cli.go:508-511 @05667f4). #574 카나리 대기로 옛 판 |
-| 노드 (mac 등 나머지) | **미측정** | desktop 에서 확인 수단 없음. director pane 주입의 마지막 구간(허브→수신 노드→pane)은 수신 측 노드 판에 달린다 |
+| 노드 (mac 등 나머지) | **미측정** | desktop 에서 확인 수단 없음. 레인 pane 주입의 마지막 구간(허브→수신 노드→pane)은 수신 측 노드 판에 달린다 |
 | 소스 정본 | `origin/main` `c1b9c0e` | #80(#507)까지 머지 — 허브·노드 모두 미배포 |
 
 이벤트는 발생 측과 라우팅 측이 다른 판일 수 있다: 노드가 만들어 허브가 owner 레인으로
@@ -29,18 +29,18 @@
 | 임의 레인 통지(사람·다른 세션의 주입 포함) | `lane.event` → owner lane push | **있음** | emit 집합 + events-lane 네임스페이스 스캔(scanHubLaneEventsWithin, hub_jobs_client.go @05667f4) |
 | 워커 정지 — settled idle/done 전이 | `idle-wake` → owner lane `lane.event` 알림 | **있음 — claim·spawn 된 잡의 pane 한정** | idle_wake.go 두 판 모두; settle 경과 후 1회 알림. owner 를 해석할 수 없는 pane 은 `unknown_owner` 로 억제된다 |
 | 잡 claim | `job.claim(ed)` → heartbeat `active_jobs` 등록 | **있음 — 풀**(owner lane push 없음) | 스캔은 claim 의 agent label 만 기억하고 relay 하지 않는다(hub_jobs_client.go:218-224 @05667f4); 허브는 첫 등록에 이벤트를 내지 않는다(hub_jobs.go:236-242 @e401923) |
-| 허브 측 잡 상태 변화 | `job.orphaned`·`job.recovered`·`job.reassigned`·`job.revoked` 허브 broadcast | **있음 — Telegram·허브 UI(director 레인 아님)** | hub_jobs.go @e401923(:254·:383·:479·:503); `job.orphaned` 는 Telegram `SendJob` 도 보내고(:520-531) `GET /v1/jobs/orphaned` 풀도 있다(hub.go:558 @05667f4, operator 인증). 노드 다운으로 잡이 떨어질 때 쓸 수 있는 직접 배포 신호다(노드 다운 자체는 §2 hub_alert 도 알린다) |
+| 허브 측 잡 상태 변화 | `job.orphaned`·`job.recovered`·`job.reassigned`·`job.revoked` 허브 broadcast | **있음 — Telegram·허브 UI(레인 push 아님)** | hub_jobs.go @e401923(:254·:383·:479·:503); `job.orphaned` 는 Telegram `SendJob` 도 보내고(:520-531) `GET /v1/jobs/orphaned` 풀도 있다(hub.go:558 @05667f4, operator 인증). 노드 다운으로 잡이 떨어질 때 쓸 수 있는 직접 배포 신호다(노드 다운 자체는 §2 hub_alert 도 알린다) |
 | 워커 정체 — working 중 hang | stall detection v1 → `lane.event` | **미배포** | `69068b0`(#66) origin/main 만. shadow 모드이고 `--stall-detect-notify` 기본 off — 배포돼도 notify 켜기 전까지 알림 없음 |
-| pane 소실·job 회수 | `job.lost`·`job.revoked` owner-lane 릴레이 | **미배포** | `c1b9c0e`(#80) origin/main 만. 배포 판 emit 집합에 두 kind 없음 — wrk sentinel 이 로컬 파일로 쓰고(bin/wrk:2103 @fb83092 주석) hub→node revocation 은 노드가 로컬 기록(hub_client.go:668 @05667f4)하지만, **director 에 push 되지 않는다**. idle-wake 도 pane 소실을 알리지 않는다 — `pane_missing` 은 후보 취소다(idle_wake.go:402 @05667f4). `panewire wait --agent` 도 pane 소멸에 끝나지 않고 timeout 까지 기다린다(wait.go @05667f4) |
+| pane 소실·job 회수 | `job.lost`·`job.revoked` owner-lane 릴레이 | **미배포** | `c1b9c0e`(#80) origin/main 만. 배포 판 emit 집합에 두 kind 없음 — launcher 의 완료 감시자는 소실을 로컬 잡 이벤트로 기록할 뿐이고 hub→node revocation 은 노드가 로컬 기록(hub_client.go:668 @05667f4)하지만, **owner 레인에 push 되지 않는다**. idle-wake 도 pane 소실을 알리지 않는다 — `pane_missing` 은 후보 취소다(idle_wake.go:402 @05667f4). `panewire wait --agent` 도 pane 소멸에 끝나지 않고 timeout 까지 기다린다(wait.go @05667f4) |
 | `job.spawned`·`job.reaped`·`job.reclaim` 등 나머지 잡 이벤트 | — | **없음** | 배포 판뿐 아니라 origin/main 의 `emitRelayKinds`·relay kind 집합에도 없다(`job.spawned` 자체는 active-job 스캔이 pane 메타데이터로 읽을 뿐 relay 되지 않는다) — 배포를 기다리는 항목이 아니라 새 이벤트 추가 대상이다 |
 | 임의 pane 상태 전이(working→blocked 등) | — | **없음**(범위 2 — 노드가 내는 이벤트로 설계) | herdr 이벤트는 노드 로컬 store 기록·idle-wake 판정 입력일 뿐 push 경로 아님(events.go @05667f4) |
-| 워커 머신 로드·메모리·쿼터·세션 | heartbeat telemetry → 허브 | **있음 — 풀**(director push 아님) | heartbeat payload `host_load`·`host_memory`·`quota`·`sessions`(hub.go:1106 @05667f4); 허브 `/v1/nodes`·console(#45/#598)에서 조회 |
+| 워커 머신 로드·메모리·쿼터·세션 | heartbeat telemetry → 허브 | **있음 — 풀**(레인 push 아님) | heartbeat payload `host_load`·`host_memory`·`quota`·`sessions`(hub.go:1106 @05667f4); 허브 `/v1/nodes`·console(#45/#598)에서 조회 |
 
 ## 2. 호스트 건강
 
 | 감시하던 것 | panewire 이벤트 | 배포 판 | 근거 |
 |---|---|---|---|
-| 노드 다운·heartbeat stale | 허브 alert | **있음 — 경로는 Telegram**(director 레인 아님) | hub_alert.go @e401923: heartbeat 관측→alert 상태기계→`notifier.Send`(hub_tg.go). watched node-down 재알림 `cf58951` 두 판 모두 |
+| 노드 다운·heartbeat stale | 허브 alert | **있음 — 경로는 Telegram**(레인 push 아님) | hub_alert.go @e401923: heartbeat 관측→alert 상태기계→`notifier.Send`(hub_tg.go). watched node-down 재알림 `cf58951` 두 판 모두 |
 | 커스텀 호스트 체크 결과 | `--checks-config` 체크 → heartbeat.checks → 허브 alert | **기능 있음 · desktop 미설정** | checks.go `LoadHubChecksConfig`·`runHubChecks`(두 판); 실행 중 desktop 데몬 argv 에 `--checks-config` 없음(실측) |
 | syspolicyd 부재·크래시 .ips·exec 정지 등 mac 호스트 내부 신호 | — | **없음**(범위 3 — 노드 헬스 신호: 노드가 주기 측정하고 전이 시 1회 알림) | 해당 신호의 이벤트는 아직 존재하지 않음 — 별도 태스크·노드 배포 필요 |
 | 노드 자동업데이트(trial·overdue) | update 이벤트 | **미배포** | `b08ab5d`(#76) origin/main 만 — #574 카나리 대기와 같은 배포 단위 |
@@ -87,8 +87,8 @@ limit를 허브 수명에 묶어 허브 자체가 단일 장애점이 되고, �
   `relay.unrouted`), handoffkeep 이 설정돼 있으면 이벤트는 영속이 성공해야
   주입된다(relay.go:418-425·773-781 @e401923 — `lane.event`뿐 아니라 `job.*`
   도 같다).
-  `wrk spawn` 에 `--owner`/`--lane` 이 빠지면 `default` 로 들어가 push 는 오지
-  않는다. director pane 주입의 마지막 구간은 수신 측 노드(mac, 미측정)에 달렸다
+  `runtug spawn` 에 `--owner`(위임 좌석은 `--lane`)가 빠지면 `default` 로 들어가 push 는 오지
+  않는다. 레인 pane 주입의 마지막 구간은 수신 측 노드(mac, 미측정)에 달렸다
   — pane 주입 자체는 `panewire prompt` 경로로 매일 관측되는 구간이다. mac 노드
   판은 operator 자격이 있는 쪽에서 허브 `GET /v1/nodes` 로 측정할 수 있다
   (desktop 에는 operator 토큰이 없어 미측정으로 둔다).

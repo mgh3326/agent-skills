@@ -26,8 +26,8 @@ Not for: deploys or infra changes (send to operator-desk; `ops` deploy), or deci
 
 ## Authority
 
-- **Repo session:** creates the task, spawns workers, runs the merge gate, merges, reaps.
-  It does not deploy.
+- **Repo session:** creates the task, spawns workers, runs the merge gate, merges. mergewake
+  reaps merged PRs' workers; the repo session reaps only what mergewake does not. It does not deploy.
 - **Worker and delegated seat:** implement and report. They never merge, deploy, or touch
   brokers, live servers, secrets or migrations.
 - **operator-desk:** orders and judges deploys, registers lane routes.
@@ -92,7 +92,8 @@ to a spawned worker; **T2 and above always**.
 
 1. **Task.** Decide and record on the hk task: grade, tier, urgency (hk priority 1–2 =
    urgent), capability tags (`unity`, `xcode`, `gpu`, `linux`; none = any host). Put the
-   marker in the title — runtug refuses without it. One task = one PR.
+   marker in the title — runtug refuses without it, and refuses a `--t` that differs from it.
+   One task = one PR.
    ```sh
    handoffkeep tasks add --project <project> --title '<title> (grade <G>, <T>)' \
      --priority <n> --expected <duration>
@@ -105,23 +106,25 @@ to a spawned worker; **T2 and above always**.
    git -C ~/work/<repo> fetch
    git -C ~/work/<repo> worktree add -b wk/<slug> ~/work/<repo>.<slug> origin/main
    ```
-   (`wt switch --create <slug>` also links `.env`; a raw worktree has none.)
+   (`wt switch --create <slug>` also links `.env`; a raw worktree has none.) The worker is
+   spawned with `-c` set to this worktree: mergewake reap finds a PR's worker by the pane's cwd.
 3. **Brief.** Copy §Worker brief to `~/work/herdr-inbox/jobs/<job>/brief.md` and fill it
    following §Brief rules.
-4. **Pick the model.** `pacelever --recommend <grade> --role worker` ranks candidates. Pool
-   order: SWE-2 free → subscription quota that would be wasted before reset (`WASTE`) → pi
-   credit (expires 2026-11-16; pace it to finish by then) → other subscriptions by ranking.
-   Urgent work does not wait for SWE-2 when paid quota is plentiful. An explicit `-m` or
-   `--host NAME` needs a reason recorded on the task.
+4. **Model and host are runtug's.** With `-m auto` runtug filters the quota catalog by the
+   task's grade, role and tags, orders pools by its pool-order policy (free → `WASTE`
+   subscription → credit → ranked; urgent work moves free last) and admits the first candidate
+   that passes presence and the quota gate; unknown evidence fails closed. Do not pick a model
+   from a recommend list. `pacelever --json` shows quota; `pacelever refresh <pool>` re-measures
+   a stale pool. An explicit `-m` or `--host NAME` needs `--override-reason`, which is recorded.
 5. **Preview, then spawn** (`ops` spawn):
    ```sh
-   runtug spawn -c ~/work/<repo>.<slug> -m <profile> -p ~/work/herdr-inbox/jobs/<job>/brief.md \
-     -w workers -l <job> --t <T> --task <id> --owner <repo-session-lane> --job <job> \
+   runtug spawn -c ~/work/<repo>.<slug> -m auto -p ~/work/herdr-inbox/jobs/<job>/brief.md \
+     -w workers -l <job> --t <T> --task <id> --role worker --owner <repo-session-lane> \
      --host auto [--tags unity] --report ~/work/herdr-inbox/jobs/<job>/report.md --dry-run
    ```
-   Check profile, host and preamble, then run it without `--dry-run`. runtug is in shadow
-   migration: on a tooling refusal fall back to `wrk spawn` with the same arguments. Use
-   exactly one launcher per task.
+   `-l <job>` is also the job id and the pane name mergewake looks up. Check profile, host and
+   the prepended host-safety preamble, then run it without `--dry-run`. A refusal is read from
+   its exit code (runtug `docs/config.md`); it is never a reason to launch the task another way.
 6. **Landing check.** Confirm the brief was received (`ops` spawn §4-2), then stay idle until
    the worker's READY/ESC arrives. No polling loops.
 7. **On READY**, verify the push yourself — `git ls-remote origin wk/<slug>` must show the
@@ -137,7 +140,9 @@ to a spawned worker; **T2 and above always**.
    A refused merge (head moved, conflict) means rerun the gate on the new head; do not clean
    up. Only after `MERGED`: check the report exists at its path outside the worktree
    (harvest it from the pane first if not — a closed pane loses it); once it exists, close
-   the hk task, then reap (`ops` reap: preview, then `--apply`). Deploys go to operator-desk.
+   the hk task. The mergewake daemon closes the worker pane at once (its last screen goes to
+   the job dir) and removes the worktree and branch after `worktree_after` — do not close or
+   remove them by hand (`ops` reap). Deploys go to operator-desk.
 
 ## Merge gate
 
@@ -189,7 +194,7 @@ A required check failed, or a critical/high finding is unresolved. Spawn a **fix
 create a follow-up hk task (`<title> — fix PR #<n>`, with `--expected`), and run the loop
 from step 3 on the same branch with a new job id, that new task, and the failing checks or
 findings in its brief. Do not reuse the original task id — it is still bound to the
-finished job, and `wrk` refuses a `--task` bound to another job. Never re-prompt a finished
+finished job, and runtug refuses a `--task` bound to another job. Never re-prompt a finished
 worker's pane — it is terminal; reap it. If the fix needs a decision, escalate instead.
 
 ## Harvest — the `[wake]` event
@@ -224,7 +229,8 @@ original guards. A temporary observation uses `panewire wait --agent NAME --stat
 ## Delegated seat
 
 A parent lane may spawn a seat to run this loop for one PR on its behalf
-(`wrk spawn --role builder --lane <seat-lane> --parent <parent-lane> --task <id>`).
+(`runtug spawn --role builder --lane <seat-lane> --parent <parent-lane> --task <id>`; this role
+refuses `--owner`).
 
 - **Identity.** `--task` is required; the spawn claims that task and binds `refs.job_id`.
   The seat's lane must be registered: the OK line ends in `lane=<lane>@<machine>`, and
@@ -268,7 +274,8 @@ A parent lane may spawn a seat to run this loop for one PR on its behalf
   bound on any mutation); keep the gate light for free mock scope and strict for sealed,
   live or reserved resources.
 - Put prohibitions and safety constraints in the initial brief — an injection during a long
-  turn takes effect only when the model reads it.
+  turn takes effect only when the model reads it. runtug prepends the fleet host-safety block
+  (no local DB servers, changed tests only, stop your own PIDs, worktree only); do not repeat it.
 
 ## Operator confirmation provenance
 
@@ -336,7 +343,7 @@ Environment: <test DB | dry-run | production (operator present)>
 - Comparison or mutant copies come from `git clone` or `git worktree add`, never `cp -R` of a
   linked worktree.
 - Isolated HOME/XDG is for test and probe runs only; spawn, placement and delivery commands
-  (`pacelever`, `runtug`/`wrk`, `panewire`) run with the real HOME.
+  (`pacelever`, `runtug`, `panewire`) run with the real HOME.
 - Never ask a question in this pane — no confirmation prompt, no AskUserQuestion or other
   interactive chooser; nobody sees it and it blocks silently. On a decision emit
   `panewire emit --kind lane.event --lane <parent-lane> --type decision --event-id <job>-decision-<n> --text '[<job>] ESC | <question> | options: <A>/<B> | default: <A>'`

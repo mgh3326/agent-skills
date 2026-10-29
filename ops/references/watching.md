@@ -49,7 +49,7 @@
 
 ## 스폰 후 대기 — 유휴와 이벤트 기상
 
-워커·tester를 스폰하고 착지를 확인한 뒤 builder 는 **유휴로 대기하고, 완료
+워커를 스폰하고 착지를 확인한 뒤 스폰한 세션은 **유휴로 대기하고, 완료
 알림으로 깨어난다**. 완료·에스컬레이션·settled idle 전이는 panewire 가
 `job.*`·`lane.event`·`idle-wake` 로 owner 레인에 push 한다 — 턴마다 pane·잡
 디렉터리·report 파일을 확인하는 폴링 반복은 금지다(#636: 감시 루프는 세션과
@@ -57,8 +57,9 @@
 
 - 허용되는 유일한 능동 대기는 **bounded timeout 있는 블로킹 명령 1개**
   (`panewire wait --agent <이름> --status idle --settle 60s --timeout <한계>`
-  등 — `--timeout` 은 필수 인자다)다. 그 종료는 완료 증거가 아니라 깨어남
-  신호다 — wait 종료 후의 판정은 언제나 산출물이다. `panewire wait --agent`는
+  등 — `--timeout` 은 필수 인자다)다. `runtug spawn … --wait --wait-timeout <한계>` 도
+  같은 1개로 센다(rc 0 완료·READY, 83 ESC, 84 lost·revoked, 85 timeout). 그 종료는 완료
+  증거가 아니라 깨어남 신호다 — wait 종료 후의 판정은 언제나 산출물이다. `panewire wait --agent`는
   로컬 herdr 소켓만 본다 — 원격 배치 워커에는 쓸 수 없다.
 - 기다리는 동안 턴을 소비하지 않는다. 확인이 필요하면 블로킹 명령으로 묶거나,
   이벤트가 올 때까지 둔다.
@@ -71,10 +72,11 @@
 
 panewire R19a 계약은 두 종류의 이벤트를 같이 소비한다.
 
-- arbiter 산출물은 envelope이다: `job_id`, `seq`, `kind`, `payload`, `created_at`. 빌더 claim의
+- arbiter 산출물은 envelope이다: `job_id`, `seq`, `kind`, `payload`, `created_at`. 위임 좌석 claim의
   `payload.parent_lane`이 상위 목적지다.
-- `wrk done`, `wrk escalate`, `wrk joined` 산출물은 events 디렉터리의 평면 레코드다.
-  빌더의 `job.escalate`와 `job.joined`는 `owner_lane`에 반드시 **빌더 자신의 레인**을 기록하고,
+- `runtug done`·`runtug escalate`는 `arbiter event`로 기록하므로 같은 envelope이다(runtug에는
+  `joined`가 없다). 평면 레코드는 옛 launcher 잡의 events 디렉터리에만 있다.
+  위임 좌석의 `job.escalate`는 `owner_lane`에 **좌석 자신의 레인**을 기록하고,
   정보용 `parent_lane`도 함께 기록한다. `parent_lane`은 라우팅 근거가 아니다. R19a는
   panewire의 `lanes.json`으로 owner 레인의 parent를 해석해 상위 pane으로 주입한다.
 

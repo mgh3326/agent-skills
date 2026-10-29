@@ -139,17 +139,14 @@ for line in open(sys.argv[1], encoding="utf-8"):
 PY
 }
 
-# ── static: docs name the class and the guard; no signal path exists ───────
+# ── static: --help names the class and the guard; no signal path exists ────
+# ops/references/heavy.md now documents runtug heavy, which has no priority
+# class (hk 2317), so only bin/wrk's own help carries these tokens.
 help_out="$("$WRK" heavy --help)"
 for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 'class=ci|lane' \
   'kind=defer' 'preempt' 'not a lock' 'renamed into place' 'starting up' \
   'spent WRK_HEAVY_CI_DEFER_MAX'; do
   grep -qF -- "$token" <<<"$help_out" || fail "heavy --help must mention: $token"
-done
-for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer \
-  '원자적' '약속하지 않는 것'; do
-  grep -qF -- "$token" "$ROOT/ops/references/heavy.md" ||
-    fail "ops/references/heavy.md must mention: $token"
 done
 python3 - "$WRK" <<'PY'
 import ast, re, sys
