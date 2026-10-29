@@ -68,6 +68,7 @@ jobs:
             tests/test-decision-request-doc.sh \
             tests/test-input-line-not-evidence.sh \
             tests/test-ops-wake-contract.sh \
+            tests/test-install-prune.sh \
             tests/test-tester-eligible.sh \
             tests/test-assignment-defaults.sh \
             tests/test-merge-precheck.sh \

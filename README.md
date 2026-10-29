@@ -15,38 +15,14 @@ fencing token 단조성·stale/replay release 거부·GC가 `unknown` 기록을 
 
 > ROB-NNN 은 비공개 이슈 트래커 참조이며, 각 규칙 옆 본문이 근거를 자립 설명한다.
 
-## Round-extension tester grant (hk 1632)
-
-After a round-extension document exists, the next round's tester/reviewer/counsel
-may use codex-astra xhigh or fable without a per-spawn operator request. Use
-`wrk spawn ... --role tester --purpose round-extension --round-ext hk:doc/round-ext/JOB
---parent-job JOB`. The two flags require each other. Accepted keys are
-`round-extension/JOB`, `round-ext/JOB`, and `<project>/round-ext/JOB`.
-JOB follows the generic document segment rule `[a-z0-9][a-z0-9._-]*`;
-project is `[a-z0-9][a-z0-9-]*`. The entire REF is at most 128 ASCII characters.
-Uppercase, leading punctuation and dot-only JOBs are refused.
-The final job must equal the explicit parent job; the hk task must be bound to
-that parent. Document/task lookup failures refuse before catalog and quota calls;
-the document's server-set created_by must be an operator issuer or the job's
-authorized parent lane, using the same issuer allow-list as round open --extend.
-pa-integrator also requires a ParkingArcade task. Ambiguous/missing task fields
-and control characters refuse. Astra/fable tester and reviewer roles always need
-this verified grant; ordinary counsel purposes retain their existing behavior.
-`--task-hk-bypass` cannot relax this. Only codex-astra (xhigh pinned) and fable
-qualify, only as tester/reviewer/counsel. Quota checks still apply.
-
-Prefer the family other than the builder's (Anthropic builder → astra; OpenAI → fable).
-If astra is refused, use codex-sol xhigh; if fable is refused, use opus xhigh,
-and report the refusal reason up. These are director practice, not automatic
-fallbacks. See [the round-extension procedure](director/round-extension.md).
-
 ## 도메인 오버레이
 
-`spawn-worker`·`linear-archive`·`relay-handoff`는 특정 실행 환경(되돌릴 수 없는 외부
-mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로 추상화했다. 그 사례 원문은
+`wake`·`ops`의 규칙 상당수는 특정 실행 환경(되돌릴 수 없는 외부
+mutation 등)의 구체 사례에서 뽑아 도메인 무관 형태로 추상화했다. 그 사례 원문은
 이 repo가 아니라
 개인/사설 저장소에 있다. `$AGENT_SKILLS_DOMAIN` 환경변수가 가리키는 디렉토리에
-`<skill-name>.md` 파일이 있으면 각 스킬은 적용 전에 그 파일을 먼저 읽는다(`ops`는 `ops.md`).
+`ops.md` 파일이 있으면 `ops`는 적용 전에 그 파일을 먼저 읽는다. 옛 스킬 이름의 오버레이
+(`spawn-worker.md`·`relay-handoff.md`·`linear-archive.md`)는 더 이상 읽히지 않는다 — `ops.md`로 합친다.
 `AGENT_SKILLS_DOMAIN` 미설정이나 해당 디렉토리 부재는 정상 상태다(추상 규칙만 적용) —
 경고 없음. `./install.sh --check`가 오버레이 설정 여부를 한 줄로 보여준다. 같은
 검사에서 `bin/wrk`의 `PROFILE_KIND`에서 에이전트 CLI를 파생해 설치 여부를 표시하고,
@@ -57,26 +33,24 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 
 | 스킬 | 용도 |
 |---|---|
-| `relay-handoff` | 세션 간 작업·분석·지시 전달 — 핸드오프 5요소 템플릿 + herdr 주입·제출검증 |
-| `spawn-worker` | 워커/tester 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
-| `director` | 운영자 직속 최상위 역할 — 머지·배포·큐 권한, 빌더 브리프·스폰·독립 검증 판정 |
-| `checker` | director 보좌·사전 머지 검사 역할 — 릴레이 수신, 셀 수 있는 게이트·큐·레인 정리 |
-| `builder` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
-| `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드·director 경로 없음, 워커 브리프 템플릿 포함 |
-| `ops` | 레인 기계학 — 스폰·착지 확인, 릴레이·주입(5요소·`comms-contract: v1`), 자문, 결정 요청, 결정 ESC(pane 질문 금지), 폴링 없는 대기, 회수, 배포 1건(installer 좌석). `SKILL.md`는 라우팅 표, 절차는 `ops/references/` |
-| `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
-| `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
-| `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
-| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음 |
+| `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드 없음, 워커 브리프 템플릿 포함 |
+| `ops` | 레인 기계학 — 스폰·착지 확인, 릴레이·주입(5요소·`comms-contract: v1`), 자문, 결정 요청, 결정 ESC(pane 질문 금지), 폴링 없는 대기, 회수, 배포 1건(installer 좌석, operator-desk 직속). `SKILL.md`는 라우팅 표, 절차는 `ops/references/` |
 
-구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
+스킬 간 관계: `wake`는 무엇을 언제 끝낼지(티어·브리프·머지 게이트)를, `ops`는 그 과정의 기계학을 담당한다.
+`wake`는 `ops`의 reference를 가리키고, `ops`는 `wake`로 되돌아가지 않는다.
+**대상 세션 부재 시 공통 규칙: 자동 재생성 없음 — 실패 보고 + 운영자 에스컬레이션.**
 
-스킬 간 관계: `spawn-worker`는 설계에서 완료 검증·회수까지 실행 루프를 담당한다.
-`relay-handoff`는 단방향 전달과 답변 파일 계약이 붙은 왕복 질의를 담당하며,
-`consult-advisor`는 자문처 해석과 headless 폴백을 추가한다. `spawn-worker`는 주입 단계에서 relay-handoff를
-참조. **대상 세션 부재 시 공통 규칙: 자동 재생성 없음 — 실패 보고 + 운영자 에스컬레이션**
-(orch/빌더 재생성은 운영자 결정; 새 세션은 같은 cwd `claude --continue`+메모리+Linear+inbox로
-상태 복원).
+### 은퇴한 스킬 (hk 2290, 2026-10-29)
+
+`planner`·`architect`·`linear-archive`·`node-ops`·`checker`·`director`·`installer`·`relay-handoff`·
+`consult-advisor`·`spawn-worker`·`builder`는 삭제됐다(호환 stub 없음). 옮겨 간 곳:
+relay-handoff → `ops/references/relay.md`(+`session-questions.md`), consult-advisor → `consult.md`,
+installer → `deploy.md`(+`deploy-checklist.md`), spawn-worker §4·§4.x·§6 → `spawn.md`·`spawn-hosts-wrk.md`·
+`heavy.md`·`reap.md`, director 결정 요청·감시 → `decision-request.md`·`watching.md`·`panewire-events.md`,
+spawn-worker §1~§3·builder 루프·director 권한·머지 게이트 → `wake`. planner·architect·linear-archive·node-ops·
+checker와 tester 라운드 규칙은 옮기지 않았다. `director/`의 게이트 스크립트·정책 파일은 Phase B까지 남는다.
+원문 복원: `git log --diff-filter=D --format=%H -1 -- <스킬>/SKILL.md`로 삭제 커밋을 찾고
+`git show <그 커밋>^:<스킬>/SKILL.md`.
 
 ## 로드 경로 (2026-07-29 실측)
 
@@ -276,7 +250,7 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 모두 `--role builder`로 쓸 수 있다. #666 부터 런그별 빌더 철자도 열려 있다 —
 `builder-devin-medium`·`builder-devin-max`(무료 swe-2 런그, 워커 변형과 동일 argv)와
 유료 ds41 런그의 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책)다.
-빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 `spawn-worker/SKILL.md` §2-2 급표의 `builder-devin` 행이다.
+빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 scopefuel/pacelever 카탈로그의 `builder-devin` 행이다.
 #704(#594 E6 측정)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
 `builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·
 `builder-luna-max`·
@@ -360,7 +334,7 @@ tester/checker rep 2건을 돌린다. `--role builder`는 세 철자를 거부�
 빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
-argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
+argv, A+ 급 작업의 T1·T2 빌더 — 카탈로그 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
 #666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737·hk 1796·hk 1863 의 E6 측정 런그 철자(`builder-opus-low` 등 25개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그는 hk 1864 로 열림)도 `--role builder`를 받는다.
 파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료

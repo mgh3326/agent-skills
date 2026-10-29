@@ -25,6 +25,7 @@ suites-b|bash tests/test-event-monitor-doc.sh
 suites-b|bash tests/test-decision-request-doc.sh
 suites-b|bash tests/test-input-line-not-evidence.sh
 suites-b|bash tests/test-ops-wake-contract.sh
+suites-b|bash tests/test-install-prune.sh
 suites-b|bash tests/test-assignment-defaults.sh
 suites-b|bash tests/test-merge-precheck.sh
 suites-b|bash tests/test-wrk-heavy-limit.sh
@@ -35,7 +36,6 @@ suites-b|bash tests/test-area-propose.sh
 suites-b|bash tests/test-ci-suites.sh
 suites-b|bash tests/test-ci-any-ref.sh
 suites-b|bash tests/needs-full-macos.sh
-python|python3 tests/test-node-ops.py
 python|python3 -m unittest tests/test_pa_review_scan.py -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
