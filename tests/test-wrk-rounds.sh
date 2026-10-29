@@ -1610,7 +1610,7 @@ assert_rc 0
 [[ "$(joined_field i-race-release-only rounds_waived_issuer)" == "director-1" ]] || fail "rounds_waived_issuer: $(joined_field i-race-release-only rounds_waived_issuer)"
 echo "PASS i-release-without-reclaim-joins"
 
-# ── help lines ─────────────────────────────────────────────────────────
+# ── help and the one skill line each ───────────────────────────────────
 "$WRK" --help >"$TMP/usage.txt"
 grep -q 'round audit' "$TMP/usage.txt" || fail "usage must name round audit"
 grep -q -- '--rounds-waived' "$TMP/usage.txt" || fail "usage must name --rounds-waived"
@@ -1618,9 +1618,11 @@ grep -q -- '--rounds-waived' "$TMP/usage.txt" || fail "usage must name --rounds-
 grep -q 'audit' "$TMP/round-help.txt" || fail "round help must name audit"
 grep -q 'oldest open round on its own head and is refused when there is none' "$TMP/round-help.txt" ||
   fail "round help must explain per-head verdict binding"
-# hk 2290: tester rounds left the skills with the builder/director retirement;
-# --rounds-waived is documented by the wrk help alone.
-echo "PASS help-lines"
+builder_hits="$(grep -c 'rounds-waived' "$ROOT/builder/SKILL.md" || true)"
+director_hits="$(grep -c 'rounds-waived' "$ROOT/director/SKILL.md" || true)"
+[[ "$builder_hits" -eq 1 ]] || fail "builder skill must mention rounds-waived on exactly one line"
+[[ "$director_hits" -eq 1 ]] || fail "director skill must mention rounds-waived on exactly one line"
+echo "PASS help-and-skill-lines"
 
 # ── hk 1970: a head-repeat grant lets a second verdict bind to a repeated head ──
 echo "== hk1970-head-repeat =="
