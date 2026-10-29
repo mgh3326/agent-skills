@@ -16,8 +16,9 @@ The name is the method, not the builder `[wake]` harvest event (`builder` skill)
 - You are a repo session and the operator agreed on a repo change with you.
 - You are a worker spawned by such a session (follow the brief; §Worker brief is your contract).
 
-Not for: deploys or infra changes (send to the desk lane), work routed through a
-director/builder (use `builder` / `spawn-worker`), or decisions (ask the operator).
+Not for: T0 work (`spawn-worker` §2-1 — not spawned; the repo session does it directly
+and still opens a PR), deploys or infra changes (send to the desk lane), work routed
+through a director/builder (use `builder` / `spawn-worker`), or decisions (ask the operator).
 
 ## What the repo session decides vs. computes
 
@@ -70,41 +71,54 @@ plentiful; non-urgent work may wait for SWE-2.
    arguments. Use exactly one launcher per task — never submit the same live task twice.
 6. **Landing check.** Confirm the brief was received (`spawn-worker` §4-2), then stay idle
    until the worker's READY/ESC arrives. No polling loops.
-7. **On READY**, run the merge gate (below). Pass → merge. Fail → §BLOCKED.
-8. **Merge** (repo session only; workers never merge):
+7. **On READY**, record the head (`H=$(gh pr view <n> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)`)
+   and run the merge gate (below) against it. Pass → step 8. Checks still pending →
+   wait (`gh pr checks <n> --repo <owner>/<repo> --watch`) and rerun the gate; that is
+   not BLOCKED. Fail → §BLOCKED.
+8. **Merge** (repo session only; workers never merge), pinned to the gated head:
    ```sh
-   gh pr merge <n> --repo <owner>/<repo> --squash
+   gh pr merge <n> --repo <owner>/<repo> --squash --match-head-commit "$H"
+   gh pr view <n> --repo <owner>/<repo> --json state --jq .state   # must print MERGED
    ```
-   Then close the hk task and reap the pane: `runtug reap` (or `wrk reap`) as a preview,
-   then again with `--apply`.
+   A refused merge (head moved, conflict) means rerun the gate on the new head; do not
+   clean up. Only after `MERGED`: close the hk task and reap the pane — `runtug reap`
+   (or `wrk reap`) as a preview, then again with `--apply`.
 
 ## Merge gate
 
-All must hold on the current PR head:
+All must hold for head `$H`:
 
-- Required checks green — the names in `.mergewake/policy.yaml` `required_checks`:
-  `gh pr checks <n> --repo <owner>/<repo> --required`.
+- Every name in `.mergewake/policy.yaml` `required_checks` passed — read the names from
+  the policy, not from GitHub's required flag. For each `<check>`:
+  `gh pr checks <n> --repo <owner>/<repo> --json name,bucket --jq '.[]|select(.name=="<check>")|.bucket'`
+  prints `pass`. `pending`, or nothing while other checks still run (an aggregate check
+  appears late) → wait. `fail`, or still absent after every check finished → BLOCKED.
 - No unresolved critical/high finding. Every review thread is fixed or replied to; list
-  open threads with
+  unresolved threads across all pages with
   ```sh
-  gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{isResolved path comments(first:1){nodes{body}}}}}}}' \
-    -F o=<owner> -F r=<repo> -F n=<n>
+  gh api graphql --paginate -F o=<owner> -F r=<repo> -F n=<n> -f query='query($o:String!,$r:String!,$n:Int!,$endCursor:String){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{isResolved path comments(first:1){nodes{body}}}}}}}' \
+    --jq '.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved|not)'
   ```
-- Blocking paths: if the diff touches any `blocking[].paths` entry in
-  `.mergewake/policy.yaml`, two independent reviews are required — the mergewake review
-  plus a second lens (a reviewer from a family other than the author's and the first
-  reviewer's, briefed on the policy's `reason` for that path). Both must be clean.
-- The review covered the head being merged (or later commits only answer its findings).
+- The mergewake review completed. On a PR touching any `blocking[].paths` entry in
+  `.mergewake/policy.yaml`, that one `mergewake review --apply` posts two passes
+  (correctness lens, then state-risk lens); both must be posted. Check for the done marker:
+  `gh api repos/<owner>/<repo>/git/matching-refs/mergewake/reviews/<n>/ --jq '.[].ref'`
+  lists `…/<reviewed head>-done`. No done marker → the repo session reruns
+  `mergewake review` for that head (it resumes the missing pass); this is not a fix-worker job.
+- Commits after the reviewed head only answer its findings.
 
 The repo session (or the mergewake daemon's READY/BLOCKED notice, once shipped) checks
 CI. Workers do not.
 
 ## BLOCKED
 
-CI red, an unresolved critical/high finding, or a missing second review on a blocking
-path. Spawn a **fix worker** on the same branch with a new job id and the findings in
-its brief (same loop from step 3). Never re-prompt a finished worker's pane — it is
-terminal; reap it. If the fix needs a decision, escalate instead.
+A required check failed, or a critical/high finding is unresolved. Spawn a **fix worker**:
+create a follow-up hk task (`<title> — fix PR #<n>`, with `--expected`), and run the loop
+from step 3 on the same branch with a new job id, that new task, and the failing checks or
+findings in its brief. Do not reuse the original task id — it is still bound to the
+finished job, and `wrk` refuses a `--task` bound to another job. Never re-prompt a
+finished worker's pane — it is terminal; reap it. If the fix needs a decision, escalate
+instead.
 
 ## Escalation and notifications
 
