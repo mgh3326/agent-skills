@@ -63,6 +63,9 @@ panewire emit --kind lane.event --lane <parent-lane> --type decision \
 ```
 
 - Name the question, the options and the default in that one event.
+- `lane.event` reaches claude panes only (`relay.md` §3-1). If the parent lane's pane is another
+  harness (codex, grok, devin), also inject the same text with
+  `herdr agent prompt <parent-pane> '<text>'` and confirm it landed (`relay.md` §3).
 - If the default is safe (reversible, inside the brief's scope, no spend or external
   effect), continue with it and say so in the report. Otherwise stop and wait for the reply.
 - `runtug escalate <job> --question '<text>'` (or `wrk escalate`) records the same thing on

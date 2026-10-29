@@ -61,7 +61,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
 # --t 는 필수다(규모 미분류 job 은 스폰되지 않는다). 자문은 코드 변경이 없어 T0.
 ```
 
-- 자문 `--effort` 의 기본값은 **xhigh** 다 — `bin/wrk` 의 codex-astra
+- codex-astra 자문의 `--effort` 기본값은 **xhigh** 다(다른 프로필은 각자의 기본값을 쓴다) — `bin/wrk` 의 codex-astra
   DEFAULT_EFFORT 및 admiral ARCHITECT.md 의 스폰 명령과 같은 값이어야 한다
   (task #527 요건 ⑦). **max 는 운영자가 명시할 때만** 쓴다.
 - `--keep` 은 보호 표시다(#603): 자문 세션은 답변 뒤에도 후속 질의를 받으므로 세션 정리
