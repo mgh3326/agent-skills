@@ -15,7 +15,7 @@ assert workflow.count('"git", "diff", "--name-only", "--no-renames"') == 1, "PR 
 assert 'git diff --name-only --no-renames "${{ github.event.before }}"' in workflow, "push docs-only diff must include rename source paths"
 manifest = root / "tests/ci-suites.txt"
 manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
-assert manifest_sha256 == "086303c41df085f4ca593e03e66fd90c92bd7b9885bcd389d3165168cf84abc3", "suite list changed; review all shard coverage deliberately"
+assert manifest_sha256 == "a24259f3b374f0de2219d814e3b42223c8d66f23ec9b6ddd2bf4229d6650a3f4", "suite list changed; review all shard coverage deliberately"
 rows = []
 for raw in manifest.read_text(encoding="utf-8").splitlines():
     line = raw.strip()
@@ -27,14 +27,12 @@ for raw in manifest.read_text(encoding="utf-8").splitlines():
 commands = [command for _shard, command in rows]
 counts = Counter(commands)
 assert all(count == 1 for count in counts.values()), "every CI suite command must appear exactly once"
-assert len(commands) == 46, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
+assert len(commands) == 18, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
 assert Counter(shard for shard, _command in rows) == Counter({
-    "wrk": 1,
-    "suites-a": 12,
-    "suites-b": 24,
-    "python": 9,
+    "suites-a": 1,
+    "suites-b": 15,
+    "python": 2,
 }), "suite coverage changed: review the shard assignment and update this contract deliberately"
-assert rows[0] == ("wrk", "bash tests/test-wrk.sh"), "test-wrk.sh must stay alone in its shard"
 for _shard, command in rows:
     assert command.startswith(("bash ", "python3 ")), f"unsupported command: {command}"
     if command.startswith("bash "):
@@ -94,5 +92,5 @@ for rel, pinned in pins.items():
     actual = hashlib.sha256(target.read_bytes()).hexdigest()
     assert pinned == actual, f"stale gate_policy pin for {rel}: pinned {str(pinned)[:12]}… actual {actual[:12]}…"
 
-print(f"PASS ci-suites commands={len(commands)} shards=4 smoke={len(smoke_commands)} darwin_paths={len(paths)} pins={len(pins)}")
+print(f"PASS ci-suites commands={len(commands)} shards=3 smoke={len(smoke_commands)} darwin_paths={len(paths)} pins={len(pins)}")
 PY

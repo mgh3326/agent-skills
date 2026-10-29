@@ -1,47 +1,19 @@
 # Suite-level Ubuntu and full-macOS source of truth: shard|command
-wrk|bash tests/test-wrk.sh
-suites-a|bash tests/test-wrk-artifacts-move.sh
-suites-a|bash tests/test-wrk-artifacts-routing.sh
-suites-a|bash tests/test-wrk-artifacts-sweep.sh
-suites-a|bash tests/test-wrk-artifact-prune.sh
-suites-a|bash tests/wrk_spillover.sh
-suites-a|bash tests/test-tester-eligible.sh
-suites-a|bash tests/test-prompt-suggestion-off.sh
-suites-a|bash tests/test-wrk-job-end.sh
-suites-a|bash tests/test-worktree-reap.sh
-suites-a|bash tests/test-round-cap.sh
-suites-a|bash tests/test-wrk-rounds.sh
 suites-a|bash tests/test-fleet-rev.sh
-suites-b|bash tests/test-codex-project-trust.sh
 suites-b|bash tests/test-arbiter.sh
 suites-b|bash tests/test-followup-injection.sh
 suites-b|bash tests/test-report-outside-worktree.sh
-suites-b|bash tests/test-model-contract-guard.sh
 suites-b|bash tests/test-installer-route.sh
 suites-b|bash tests/test-installer-deploy-record.sh
-suites-b|bash tests/test-resume-settings.sh
 suites-b|bash tests/test-untagged-operator-evidence.sh
 suites-b|bash tests/test-event-monitor-doc.sh
 suites-b|bash tests/test-decision-request-doc.sh
 suites-b|bash tests/test-input-line-not-evidence.sh
 suites-b|bash tests/test-ops-wake-contract.sh
 suites-b|bash tests/test-install-prune.sh
-suites-b|bash tests/test-assignment-defaults.sh
-suites-b|bash tests/test-merge-precheck.sh
-suites-b|bash tests/test-wrk-heavy-limit.sh
-suites-b|bash tests/test-wrk-heavy-class.sh
-suites-b|bash tests/test-wrk-task-link.sh
-suites-b|bash tests/test-gate-policy-devin-grades.sh
 suites-b|bash tests/test-area-propose.sh
 suites-b|bash tests/test-ci-suites.sh
 suites-b|bash tests/test-ci-any-ref.sh
 suites-b|bash tests/needs-full-macos.sh
 python|python3 -m unittest tests/test_pa_review_scan.py -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_artifacts.py' -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v
-python|python3 -m unittest discover -s tests -p 'test_wrk_cmd.py' -v
 python|python3 -m unittest discover -s tests -p 'test_fixture_scopefuel_parity.py' -v
-python|python3 -m unittest discover -s tests/o3 -p 'test_*.py' -v

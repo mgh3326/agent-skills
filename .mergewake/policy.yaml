@@ -3,11 +3,9 @@ enabled: false
 required_checks:
   - 'ci-ok'
 blocking:
-  - paths: ['bin/wrk', 'bin/wrk-*', 'director/artifact_policy.json']
-    reason: Worktree reap and artifact prune or sweep can delete original files before a revert.
   - paths: ['install.sh', 'installer/**', 'ops/references/deploy*.md']
     reason: Installation and deploy procedures can replace running tools before a revert.
-  - paths: ['bin/kimi-clone-home', 'bin/rob-lookup', 'bin/wrk-codex-mcp-plan']
+  - paths: ['bin/kimi-clone-home', 'bin/rob-lookup']
     reason: Credential and workspace trust changes can expose access immediately.
   - paths: ['.github/workflows/**']
     reason: Workflow changes can execute privileged automation before a revert.

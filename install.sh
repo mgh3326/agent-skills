@@ -19,25 +19,6 @@ run_scopefuel() {
   fi
 }
 
-check_agent_clis() {
-  local kind
-  local kinds
-  kinds="$(sed -n 's/.*PROFILE_KIND=\([a-z][a-z]*\).*/\1/p' "$REPO_DIR/bin/wrk" | sort -u)"
-  echo "== 에이전트 CLI =="
-  if [ -z "$kinds" ]; then
-    echo "  ⚠️  bin/wrk에서 PROFILE_KIND를 파생하지 못함"
-    return 0
-  fi
-  while IFS= read -r kind; do
-    [ -n "$kind" ] || continue
-    if command -v "$kind" >/dev/null 2>&1; then
-      echo "  ✓ $kind ($(command -v "$kind"))"
-    else
-      echo "  · $kind — 미설치 (사용 가능한 풀로 배정)"
-    fi
-  done <<< "$kinds"
-}
-
 check_scopefuel_pools() {
   local probe="$1"
   local scopefuel_cmd
@@ -107,14 +88,13 @@ check_deps() {
   [ "${2:-}" = "--probe" ] && probe=1
   [ "${1:-}" = "--probe" ] && probe=1
   echo "== 의존성 검사 =="
-  for tool in "herdr:$HOME/.local/bin/herdr" "scopefuel:$(command -v scopefuel || true)" \
-              "wrk:$HOME/.local/bin/wrk"; do
+  for tool in "herdr:$HOME/.local/bin/herdr" "scopefuel:$(command -v scopefuel || true)"; do
     name="${tool%%:*}"; path="${tool#*:}"
     if [ -n "$path" ] && [ -x "$path" ]; then echo "  ✓ $name ($path)"
     else
       echo "  ✗ $name — 미설치 (스킬 내 폴백 절차 참조)"
       # D2: quota/auth diagnostics are advisory and fail-open when scopefuel
-      # is absent. herdr and wrk remain the required dependency gates.
+      # is absent. herdr remains the required dependency gate.
       [ "$name" = scopefuel ] || ok=1
     fi
   done
@@ -131,7 +111,6 @@ check_deps() {
   else
     echo "  · 도메인 오버레이: 없음 (미설정 — 정상, 추상 규칙만 적용)"
   fi
-  check_agent_clis
   check_scopefuel_pools "$probe"
   return $ok
 }
