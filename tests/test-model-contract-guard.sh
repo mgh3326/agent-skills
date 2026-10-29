@@ -203,6 +203,38 @@ echo "PASS old Terra profiles remain barred and the distinct Terra61 profiles ar
 assert_argv_has grok "-m $CONTRACT_GROK_MODEL_ID"
 echo "PASS grok generic fallback runs $CONTRACT_GROK_MODEL_ID"
 
+# --- hk 2240: agy native profiles launch their exact model id --------------
+# agy encodes the rung in the model id and refuses a conflicting --effort
+# (measured 2026-10-29: gemini-3.8-flash-medium with --effort high answers
+# "--model ... conflicts with --effort=high"; sonnet/opus answer "--effort is
+# not supported for model ..."). So each spelling carries its exact --model and
+# never a --effort, and all of them share the placed agy-flash gate row.
+while IFS='|' read -r agy_profile agy_expected; do
+  [[ -n "$agy_profile" ]] || continue
+  agy_argv="$(spawn_argv "$agy_profile")"
+  grep -qF -- 'agent start ' <<<"$agy_argv" &&
+    grep -qF -- '--kind agy ' <<<"$agy_argv" ||
+    fail "profile '$agy_profile' did not start the agy harness: $agy_argv"
+  grep -qF -- "$agy_expected" <<<"$agy_argv" ||
+    fail "profile '$agy_profile': expected argv to contain '$agy_expected'; got: $agy_argv"
+  if grep -qF -- '--effort' <<<"$agy_argv"; then
+    fail "profile '$agy_profile' must not pass --effort: $agy_argv"
+  fi
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == agy-flash ]] ||
+    fail "profile '$agy_profile' must gate at agy-flash; got: $(tail -n 1 "$TMP/scopefuel.log")"
+done <<'AGY'
+agy-flash|--model gemini-3.7-flash-high --dangerously-skip-permissions
+agy-flash36|--model gemini-3.6-flash-high --dangerously-skip-permissions
+agy-flash37|--model gemini-3.7-flash-high --dangerously-skip-permissions
+agy-flash38-low|--model gemini-3.8-flash-low --dangerously-skip-permissions
+agy-flash38-medium|--model gemini-3.8-flash-medium --dangerously-skip-permissions
+agy-flash38-high|--model gemini-3.8-flash-high --dangerously-skip-permissions
+agy-sonnet46|--model claude-sonnet-4-6 --dangerously-skip-permissions
+agy-opus46|--model claude-opus-4-6-thinking --dangerously-skip-permissions
+agy-oss120|--model gpt-oss-120b-medium --dangerously-skip-permissions
+AGY
+echo "PASS agy native profiles launch their exact model ids with no --effort"
+
 # --- Rollback spellings must still resolve to the pre-refresh IDs ----------
 assert_argv_has codex-sol56 "-m gpt-5.6-sol"
 assert_argv_has codex-luna56 "-m gpt-5.6-luna"

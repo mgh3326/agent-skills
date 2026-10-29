@@ -97,6 +97,8 @@ ALL_PROFILES=(
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3 oc-solar4
   agy-flash agy-flash36 agy-flash37
+  agy-flash38-low agy-flash38-medium agy-flash38-high
+  agy-sonnet46 agy-opus46 agy-oss120
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med builder-grok
   builder-grok-low builder-grok-medium builder-grok-xhigh
   cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
@@ -826,6 +828,13 @@ effort="low" in that clone's config.toml — kimi has no CLI --effort flag, so t
 is the only way to change its thinking effort). Refresh the clone with
 `bin/kimi-clone-home` any time the real ~/.kimi-code credentials rotate.
 fable does not accept --effort in this scope.
+agy native profiles (one agy pool): agy-flash runs gemini-3.7-flash-high
+(agy-flash36/agy-flash37 are rollback/synonym spellings); agy-flash38-low,
+agy-flash38-medium and agy-flash38-high run gemini-3.8-flash at that rung;
+agy-sonnet46, agy-opus46 and agy-oss120 run claude-sonnet-4-6,
+claude-opus-4-6-thinking and gpt-oss-120b-medium. agy encodes the effort in
+the model id and refuses a conflicting --effort (sonnet/opus refuse --effort
+altogether), so no agy profile accepts --effort.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 
@@ -4607,6 +4616,20 @@ resolve_profile() {
     agy-flash) PROFILE_KIND=agy; ARGS=(--model gemini-3.7-flash-high --dangerously-skip-permissions) ;;
     agy-flash36) PROFILE_KIND=agy; ARGS=(--model gemini-3.6-flash-high --dangerously-skip-permissions) ;;
     agy-flash37) PROFILE_KIND=agy; ARGS=(--model gemini-3.7-flash-high --dangerously-skip-permissions) ;;
+    # hk 2240: Gemini 3.8 Flash runs on the agy native harness at each effort.
+    # agy encodes the effort in the model id and refuses a conflicting
+    # --effort (measured 2026-10-29: "--model gemini-3.8-flash-medium conflicts
+    # with --effort=high"; the matching rung is accepted but redundant), so the
+    # spelling is the rung and EFFORT_SUPPORTED stays off.
+    agy-flash38-low) PROFILE_KIND=agy; ARGS=(--model gemini-3.8-flash-low --dangerously-skip-permissions) ;;
+    agy-flash38-medium) PROFILE_KIND=agy; ARGS=(--model gemini-3.8-flash-medium --dangerously-skip-permissions) ;;
+    agy-flash38-high) PROFILE_KIND=agy; ARGS=(--model gemini-3.8-flash-high --dangerously-skip-permissions) ;;
+    # hk 2240: the agy pool's Claude and OSS models. Their rung is fixed in the
+    # model id too: sonnet/opus answer "--effort is not supported", and
+    # gpt-oss-120b-medium conflicts with any --effort. No profile takes one.
+    agy-sonnet46) PROFILE_KIND=agy; ARGS=(--model claude-sonnet-4-6 --dangerously-skip-permissions) ;;
+    agy-opus46) PROFILE_KIND=agy; ARGS=(--model claude-opus-4-6-thinking --dangerously-skip-permissions) ;;
+    agy-oss120) PROFILE_KIND=agy; ARGS=(--model gpt-oss-120b-medium --dangerously-skip-permissions) ;;
 
     agy|agy-flash-med|agy-pro|agy-sonnet|agy-opus|agy-oss)
       die "profile '$MODEL' is retired" ;;
@@ -4706,7 +4729,10 @@ resolve_profile() {
     builder-kimi-high|builder-kimi-max) GATE_PROFILE=kimi-k3; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3|oc-solar4)
       GATE_PROFILE="$MODEL" ;;
-    agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
+    # hk 2240: every agy-native spelling shares the one agy pool; scopefuel's
+    # gate remains the pool authority and the agy-flash row is the only placed
+    # agy catalog row until the desk pushes the agy-* rows.
+    agy-flash|agy-flash36|agy-flash37|agy-flash38-low|agy-flash38-medium|agy-flash38-high|agy-sonnet46|agy-opus46|agy-oss120) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med|builder-grok) GATE_PROFILE=grok-hi ;;
     # #737: the E6 grok rungs gate at their pinned rung (unmeasured C rows
     # under #692/#737 — spawn refuses without SCOPEFUEL_E6_ARM=grok-hi@<rung>).

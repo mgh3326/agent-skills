@@ -24,6 +24,9 @@ pool_for() {
     codex*) echo codex ;;
     kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
+    # hk 2240: every agy-native launcher spelling belongs to scopefuel's
+    # single agy pool (production answers this from the catalog row).
+    agy-flash|agy-flash36|agy-flash37|agy-flash38-low|agy-flash38-medium|agy-flash38-high|agy-sonnet46|agy-opus46|agy-oss120) echo agy ;;
     oc-omni) echo omniroute ;;
     oc-*) echo clinepass ;;
     grok|grok-hi|grok-med) echo grok ;;
