@@ -5,6 +5,11 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 
 # builder — PR 루프 소유자
 
+**repo 세션이 운영자와 직접 정한 repo 작업에는 빌더를 두지 않는다 — `wake` 스킬을
+따른다**(운영자 2026-10-29): repo 세션이 워커를 직접 스폰하고, 워커는 mergewake review
+1회와 지적 처리 후 READY 를 내며, repo 세션이 머지 게이트를 확인해 머지한다. 이 스킬은
+director 경로의 빌더 작업에만 적용된다.
+
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol, effort high — 2026-09-26 운영자 결정 전에는 max 였다)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-luna`는 워커 전용이다. Terra 계열
