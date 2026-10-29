@@ -6968,6 +6968,9 @@ profiles=(
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
   "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "agy-flash:agy-flash" "agy-flash36:agy-flash" "agy-flash37:agy-flash"
+  "agy-flash38-low:agy-flash" "agy-flash38-medium:agy-flash" "agy-flash38-high:agy-flash"
+  "agy-sonnet46:agy-flash" "agy-opus46:agy-flash" "agy-oss120:agy-flash"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
   )
