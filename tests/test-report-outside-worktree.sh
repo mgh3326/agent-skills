@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Report-outside-worktree contract (2026-09-03 incident, hk 2290): a worker
+# told to leave a clean `git status` deleted a report written inside its
+# worktree. wake/SKILL.md must carry both sides of the fix:
+#   write side — §Brief rules and the §Worker brief template put the report
+#   outside the worktree and tell the worker not to delete it;
+#   collect side — merge step 8 harvests a missing report from the pane before
+#   the pane is reaped.
+# Each mutant weakens one clause in memory and must go RED by assertion.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,15 +17,8 @@ import re
 import sys
 
 root = Path(sys.argv[1])
-spawn_worker_path = Path(
-    os.environ.get("SPAWN_WORKER_SKILL", root / "spawn-worker/SKILL.md")
-)
-director_path = Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md"))
-builder_path = Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md"))
-
-spawn_text = spawn_worker_path.read_text(encoding="utf-8")
-director_text = director_path.read_text(encoding="utf-8")
-builder_text = builder_path.read_text(encoding="utf-8")
+wake_path = Path(os.environ.get("WAKE_SKILL", root / "wake/SKILL.md"))
+wake_text = wake_path.read_text(encoding="utf-8")
 
 
 def flat(text: str) -> str:
@@ -33,153 +34,89 @@ def section(text: str, heading: str) -> str:
     return body[: m.start()] if m else body
 
 
-DELETE_PERMIT = r"(지워도\s*된다|지워도\s*좋다|삭제해도\s*된다|삭제해도\s*좋다)"
+DELETE_PERMIT = r"(?i)(may|can|should) (be )?delete|delete it when|clean it up"
+REPORT_PATH = "~/work/herdr-inbox/jobs/<job>/report.md"
 
 
-def check_spawn_worker(text: str) -> None:
-    """§3 brief format must carry the write-side rule: report path is always
-    outside the worktree and the brief must say 'do not delete it'."""
-    sec = flat(section(text, "## 3. 브리프 작성"))
-    assert "보고서는 worktree 밖에 두고 지우지 않는다" in sec, (
-        "rule statement (report outside worktree, never delete) missing"
+def check_brief_rules(text: str) -> None:
+    sec = flat(section(text, "## Brief rules"))
+    assert re.search(r"\*\*Report outside the worktree:\*\*", sec), "brief rule heading missing"
+    assert REPORT_PATH in sec, "brief rule must name the report path outside the worktree"
+    assert re.search(r"does not affect `git status` and must not be deleted", sec), (
+        "brief rule must say the path does not affect git status and must not be deleted"
     )
-    assert "지우지 마라" in sec, (
-        "brief must tell the worker not to delete the report"
+    assert re.search(r"clean-tree exit condition makes the worker delete it", sec), (
+        "brief rule must keep the incident rationale"
     )
-    assert not re.search(DELETE_PERMIT, sec), (
-        "delete-permission phrasing reverses the rule"
-    )
-    assert re.search(r"git status.{0,20}영향이 없다", sec), (
-        "git status collision rationale missing"
-    )
+    assert not re.search(DELETE_PERMIT, sec), "delete-permission phrasing reverses the rule"
 
 
-def check_builder(text: str) -> None:
-    """The builder's brief format must repeat the same write-side rule."""
-    sec = flat(section(text, "## 시작과 브리프"))
-    assert re.search(r"보고서 경로는 항상\s*worktree 밖", sec), (
-        "builder brief format must pin the report path outside the worktree"
+def check_template(text: str) -> None:
+    sec = flat(section(text, "## Done"))
+    assert REPORT_PATH.replace("~/work", "~/work") in sec, "template report path missing"
+    assert re.search(r"outside the worktree, so it does not affect `git status`; do not delete it", sec), (
+        "worker brief template must carry the outside-worktree / do-not-delete clause"
     )
-    assert "지우지 마라" in sec, (
-        "builder brief format must carry the do-not-delete clause"
-    )
-    assert not re.search(DELETE_PERMIT, sec), (
-        "delete-permission phrasing reverses the rule"
-    )
-    assert "빌더 자신의 보고서도 같은 규칙" in sec, (
-        "builder's own report must be covered by the same rule"
-    )
+    assert not re.search(DELETE_PERMIT, sec), "delete-permission phrasing in the template"
 
 
-def check_director(text: str) -> None:
-    """The merge gate's post-merge harvest item must carry the collect-side
-    rule: report lives outside the worktree, harvest it before closing the
-    pane, and the standing reap conditions are unchanged."""
-    sec = flat(section(text, "## 머지 게이트"))
-    assert re.search(r"보고서는 worktree 밖.{0,80}지우지 않는다", sec), (
-        "post-merge harvest must keep reports outside the worktree and "
-        "never delete them"
+def check_collect(text: str) -> None:
+    loop = flat(section(text, "## The loop"))
+    m = re.search(r"8\. \*\*Merge\*\*.*", loop)
+    assert m, "merge step 8 missing"
+    step = m.group(0)
+    assert re.search(r"check the report exists at its path outside the worktree", step), (
+        "step 8 must check the report outside the worktree"
     )
-    assert "먼저 회수" in sec, (
-        "missing report must be harvested before the pane is closed"
+    assert re.search(r"harvest it from the pane first if not — a closed pane loses it", step), (
+        "a missing report must be harvested before the pane is reaped"
     )
-    assert "미push 0" in sec and "dry-run" in sec, (
-        "standing harvest conditions must be cited unchanged"
-    )
-    assert not re.search(DELETE_PERMIT, sec), (
-        "delete-permission phrasing reverses the rule"
+    assert "reap" not in step[: step.index("harvest it from the pane first")], (
+        "harvest must come before any reap"
     )
 
 
-check_spawn_worker(spawn_text)
-print("PASS spawn-worker write-side rule=1 no-delete-clause=1 git-status-rationale=1")
-
-check_builder(builder_text)
-print("PASS builder brief-format rule=1 own-report-covered=1")
-
-check_director(director_text)
-print("PASS director collect-side rule=1 harvest-before-close=1 standing-conditions-cited=1")
+def check(text: str) -> None:
+    check_brief_rules(text)
+    check_template(text)
+    check_collect(text)
 
 
-def expect_assertion(label, callback):
+check(wake_text)
+print("PASS wake write-side brief-rule=1 template=1 collect-side harvest-before-reap=1")
+
+
+def mutate(old: str, new: str) -> str:
+    """Replace one occurrence of old, matching any line wrapping."""
+    pattern = r"\s+".join(re.escape(word) for word in old.split())
+    assert len(re.findall(pattern, wake_text)) == 1, f"fixture: anchor not unique: {old!r}"
+    return re.sub(pattern, lambda _m: new, wake_text, count=1)
+
+
+mutants = {
+    "brief-rule-removed": mutate(
+        "- **Report outside the worktree:**", "- **Report location:**"),
+    "brief-rule-delete-permitted": mutate(
+        "does not affect `git status` and must\n  not be deleted",
+        "does not affect `git status` and may\n  be deleted after READY"),
+    "brief-rule-rationale-dropped": mutate(
+        " — otherwise a\n  clean-tree exit condition makes the worker delete it.", "."),
+    "template-clause-dropped": mutate(
+        " — outside the worktree, so it does not affect\n`git status`; do not delete it:", ":"),
+    "template-delete-permitted": mutate(
+        "do not delete it:", "you can delete it when the PR merges:"),
+    "collect-harvest-dropped": mutate(
+        " (harvest it from the pane first if not — a closed pane loses it)", ""),
+    "collect-reap-before-harvest": mutate(
+        "check the report exists at its path outside\n   the worktree (harvest it from the pane first if not — a closed pane loses it), then reap",
+        "reap, then check the report exists at its path outside\n   the worktree (harvest it from the pane first if not — a closed pane loses it), then reap"),
+}
+for name, doc in mutants.items():
     try:
-        callback()
+        check(doc)
     except AssertionError:
-        return
-    except Exception as exc:
-        raise AssertionError(
-            f"{label} mutant errored instead of assertion RED: {exc}"
-        ) from exc
-    raise AssertionError(f"{label} mutant did not go RED")
-
-
-spawn_rule_removed = re.sub(
-    r"(?s)🔴 \*\*보고서는 worktree 밖에 두고 지우지 않는다.*?남고 산출물이 사라진다\.\n\n",
-    "",
-    spawn_text,
-    count=1,
-)
-assert spawn_rule_removed != spawn_text, (
-    "fixture: spawn-worker report-outside paragraph not found to remove"
-)
-
-spawn_rule_inverted = spawn_text.replace("지우지 마라", "지워도 된다", 1)
-assert spawn_rule_inverted != spawn_text, (
-    "fixture: spawn-worker do-not-delete clause not found to invert"
-)
-
-builder_rule_removed = re.sub(
-    r"(?s) 🔴 보고서 경로는 항상.*?같은 규칙이다\.",
-    ".",
-    builder_text,
-    count=1,
-)
-assert builder_rule_removed != builder_text, (
-    "fixture: builder brief-format rule not found to remove"
-)
-
-director_rule_removed = re.sub(
-    r"(?s) 🔴 보고서는 worktree 밖.*?바꾸지 않는다\.",
-    ".",
-    director_text,
-    count=1,
-)
-assert director_rule_removed != director_text, (
-    "fixture: director harvest rule not found to remove"
-)
-
-director_close_first = director_text.replace(
-    "pane을 닫기 전에 먼저 회수한다",
-    "pane을 먼저 닫고 나중에 회수한다",
-    1,
-)
-assert director_close_first != director_text, (
-    "fixture: director harvest-before-close clause not found to invert"
-)
-
-assertion_red_mutants = [
-    (
-        "spawn-worker-rule-removed",
-        lambda: check_spawn_worker(spawn_rule_removed),
-    ),
-    (
-        "spawn-worker-rule-inverted",
-        lambda: check_spawn_worker(spawn_rule_inverted),
-    ),
-    ("builder-rule-removed", lambda: check_builder(builder_rule_removed)),
-    (
-        "director-rule-removed",
-        lambda: check_director(director_rule_removed),
-    ),
-    (
-        "director-close-before-harvest",
-        lambda: check_director(director_close_first),
-    ),
-]
-for label, callback in assertion_red_mutants:
-    expect_assertion(label, callback)
-print(
-    "PASS mutants assertion-red="
-    f"{len(assertion_red_mutants)}/{len(assertion_red_mutants)}"
-)
+        print(f"RED {name}")
+        continue
+    raise SystemExit(f"mutant {name} did not go RED")
+print(f"PASS mutants assertion-red={len(mutants)}/{len(mutants)}")
 PY

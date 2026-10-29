@@ -6,7 +6,6 @@ suites-a|bash tests/test-wrk-artifacts-sweep.sh
 suites-a|bash tests/test-wrk-artifact-prune.sh
 suites-a|bash tests/wrk_spillover.sh
 suites-a|bash tests/test-tester-eligible.sh
-suites-a|bash tests/test-t3-split-rule.sh
 suites-a|bash tests/test-prompt-suggestion-off.sh
 suites-a|bash tests/test-wrk-job-end.sh
 suites-a|bash tests/test-worktree-reap.sh
@@ -15,8 +14,6 @@ suites-a|bash tests/test-wrk-rounds.sh
 suites-a|bash tests/test-fleet-rev.sh
 suites-b|bash tests/test-codex-project-trust.sh
 suites-b|bash tests/test-arbiter.sh
-suites-b|bash tests/test-openai-independent-gate.sh
-suites-b|bash tests/test-builder-path.sh
 suites-b|bash tests/test-followup-injection.sh
 suites-b|bash tests/test-report-outside-worktree.sh
 suites-b|bash tests/test-model-contract-guard.sh
@@ -27,8 +24,7 @@ suites-b|bash tests/test-untagged-operator-evidence.sh
 suites-b|bash tests/test-event-monitor-doc.sh
 suites-b|bash tests/test-decision-request-doc.sh
 suites-b|bash tests/test-input-line-not-evidence.sh
-suites-b|bash tests/test-tester-family-policy.sh
-suites-b|bash tests/test-ci-canonical-prose.sh
+suites-b|bash tests/test-ops-wake-contract.sh
 suites-b|bash tests/test-assignment-defaults.sh
 suites-b|bash tests/test-merge-precheck.sh
 suites-b|bash tests/test-wrk-heavy-limit.sh

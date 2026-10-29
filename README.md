@@ -46,7 +46,7 @@ fallbacks. See [the round-extension procedure](director/round-extension.md).
 mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로 추상화했다. 그 사례 원문은
 이 repo가 아니라
 개인/사설 저장소에 있다. `$AGENT_SKILLS_DOMAIN` 환경변수가 가리키는 디렉토리에
-`<skill-name>.md` 파일이 있으면 각 스킬은 적용 전에 그 파일을 먼저 읽는다.
+`<skill-name>.md` 파일이 있으면 각 스킬은 적용 전에 그 파일을 먼저 읽는다(`ops`는 `ops.md`).
 `AGENT_SKILLS_DOMAIN` 미설정이나 해당 디렉토리 부재는 정상 상태다(추상 규칙만 적용) —
 경고 없음. `./install.sh --check`가 오버레이 설정 여부를 한 줄로 보여준다. 같은
 검사에서 `bin/wrk`의 `PROFILE_KIND`에서 에이전트 CLI를 파생해 설치 여부를 표시하고,
@@ -62,7 +62,8 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `director` | 운영자 직속 최상위 역할 — 머지·배포·큐 권한, 빌더 브리프·스폰·독립 검증 판정 |
 | `checker` | director 보좌·사전 머지 검사 역할 — 릴레이 수신, 셀 수 있는 게이트·큐·레인 정리 |
 | `builder` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
-| `wake` | repo 세션의 PR 루프(wake method) — 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드·director 경로 없음, 워커 브리프 템플릿 포함 |
+| `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드·director 경로 없음, 워커 브리프 템플릿 포함 |
+| `ops` | 레인 기계학 — 스폰·착지 확인, 릴레이·주입(5요소·`comms-contract: v1`), 자문, 결정 요청, 결정 ESC(pane 질문 금지), 폴링 없는 대기, 회수, 배포 1건(installer 좌석). `SKILL.md`는 라우팅 표, 절차는 `ops/references/` |
 | `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |

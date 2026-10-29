@@ -148,8 +148,8 @@ for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 'class=ci|lane' \
 done
 for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer \
   '원자적' '약속하지 않는 것'; do
-  grep -qF -- "$token" "$ROOT/spawn-worker/SKILL.md" ||
-    fail "spawn-worker/SKILL.md heavy section must mention: $token"
+  grep -qF -- "$token" "$ROOT/ops/references/heavy.md" ||
+    fail "ops/references/heavy.md must mention: $token"
 done
 python3 - "$WRK" <<'PY'
 import ast, re, sys
