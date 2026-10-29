@@ -1,5 +1,5 @@
 #!/bin/bash
-# agent-skills 설치 — 심링크 생성 + 의존성 검사
+# agent-skills 설치 — 심링크 생성 + 끊긴 심링크 정리 + 의존성 검사
 # 사용: ./install.sh [--check [--probe]]
 #   (repo는 ~/.agents/skills 에 clone되어 있어야 함 — codex가 이 경로를 직접 스캔)
 set -u
@@ -118,6 +118,12 @@ check_deps() {
       [ "$name" = scopefuel ] || ok=1
     fi
   done
+  # wake-method tools are optional until runtug leaves shadow migration.
+  for name in runtug pacelever mergewake; do
+    path="$(command -v "$name" || true)"
+    if [ -n "$path" ]; then echo "  ✓ $name ($path)"
+    else echo "  · $name — 미설치 (선택: wake 방식 도구)"; fi
+  done
   command -v wt >/dev/null 2>&1 || type wt >/dev/null 2>&1 \
     && echo "  ✓ wt" || echo "  △ wt — 셸 함수라 비로그인 셸에선 안 보일 수 있음 (폴백: git worktree add + 수동 .env)"
   if [ -n "${AGENT_SKILLS_DOMAIN:-}" ] && [ -d "$AGENT_SKILLS_DOMAIN" ]; then
@@ -128,6 +134,29 @@ check_deps() {
   check_agent_clis
   check_scopefuel_pools "$probe"
   return $ok
+}
+
+# Remove the links an earlier install made that now dangle: a skill directory
+# that was deleted or lost its SKILL.md, or a bin/ tool that is gone. Only
+# symlinks whose target lies inside this repo are touched; regular files,
+# directories and links that point elsewhere are left alone.
+prune_links() {
+  local dir="$1" kind="$2" link dest
+  [ -d "$dir" ] || return 0
+  for link in "$dir"/*; do
+    [ -L "$link" ] || continue
+    dest="$(readlink "$link")"
+    case "$dest" in
+      "$REPO_DIR"/*) ;;
+      *) continue ;;
+    esac
+    if [ "$kind" = skill ]; then
+      [ -f "$dest/SKILL.md" ] && continue
+    else
+      [ -e "$dest" ] && continue
+    fi
+    rm -f "$link" && echo "  pruned $link"
+  done
 }
 
 if [ "${1:-}" = "--check" ]; then check_deps "$@"; exit $?; fi
@@ -152,6 +181,12 @@ for target in "${LINK_TARGETS[@]}"; do
     ln -sfn "$REPO_DIR/$name" "$target/$name"
     echo "  $target/$name -> $REPO_DIR/$name"
   done
+done
+
+echo "== 끊긴 심링크 정리 =="
+prune_links "$HOME/.local/bin" bin
+for target in "${LINK_TARGETS[@]}"; do
+  prune_links "$target" skill
 done
 
 check_deps || true

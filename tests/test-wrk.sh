@@ -11422,11 +11422,12 @@ done
 expect_exit 2 spawn_base gpt-6-astra --job removed-gpt-6-astra --t T1
 echo "PASS removed-astra-builder-spellings-hit-tombstone"
 
-# task #526 AC4: the three builder surfaces must name the same profile set —
-# builder/SKILL.md, the `wrk spawn --help` --role paragraph and the --role
-# builder accept list. Fixing only one side must turn this RED (that read-order
-# dependence is what #505 removed). The literal accept-line pin also makes
-# re-adding an astra spelling to the list alone go RED.
+# task #526 AC4: the builder surfaces must name the same profile set — the
+# `wrk spawn --help` --role paragraph and the --role builder accept list.
+# Fixing only one side must turn this RED (that read-order dependence is what
+# #505 removed). The literal accept-line pin also makes re-adding an astra
+# spelling to the list alone go RED. hk 2290 retired the builder skill, so the
+# profile catalog is no longer restated in a skill file.
 accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
@@ -11435,19 +11436,15 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|bui
 # the pilot worker spellings. Bare 'grok' is not extracted (it also matches
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself. `builder-level` is prose, `captain-NN` is a
-# session name in SKILL.md — neither is a profile.
+# session name — neither is a profile.
 builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | grep -v '^builder-terra61-' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
-skill_set="$(builder_tokens <"$ROOT/builder/SKILL.md")"
 [[ "$accept_set" == "$help_set" ]] ||
   fail "builder profile set drift (accept vs help): $(diff <(echo "$accept_set") <(echo "$help_set"))"
-[[ "$accept_set" == "$skill_set" ]] ||
-  fail "builder profile set drift (accept vs SKILL.md): $(diff <(echo "$accept_set") <(echo "$skill_set"))"
 if grep -iq 'astra' <<<"$help_block"; then fail "--role help paragraph still names astra"; fi
-if grep -iq 'astra' "$ROOT/builder/SKILL.md"; then fail "builder/SKILL.md still names astra"; fi
-echo "PASS builder-profile-set-three-source-consistency"
+echo "PASS builder-profile-set-two-source-consistency"
 
 # A legacy/canonical role pair must not create two role-distinct claims for the
 # same job: the second real spawn remains an active duplicate and the first

@@ -3,12 +3,14 @@
 # 4088 B + note/2026-09-26/grade-cost-table id 4098 — the FINAL rule is
 # "among candidates whose grade is at least the task grade, pick the lowest
 # cost per task"; the listed model/effort pairs are its current output, not a
-# hard-coded list; Sonnet=T2 is withdrawn). The three skill files must each
-# carry the T736 block; bin/wrk must no longer refuse a max rung on a builder seat
+# hard-coded list; Sonnet=T2 is withdrawn). hk 2290 retired the skill copies
+# of that block (the catalog is pacelever/scopefuel, not a skill); what stays
+# here is the launcher side: bin/wrk must not refuse a max rung on a builder seat
 # (hk 1864, operator 2026-10-23, superseding the 09-26 no-max rule; ultra stays
-# refused) and still default builder-sol to high; gate_policy.json must agree. Every mutant
-# weakens one policy row in-memory and must go RED by assertion — repository
-# files are never modified.
+# refused) and still default builder-sol to high; gate_policy.json must agree;
+# the README must not claim a marked rung needs a REF. Every mutant weakens one
+# row in-memory and must go RED by assertion — repository files are never
+# modified.
 set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
@@ -24,18 +26,12 @@ import sys
 
 root = Path(sys.argv[1])
 paths = {
-    "spawn": Path(os.environ.get("SPAWN_WORKER_SKILL", root / "spawn-worker/SKILL.md")),
-    "builder": Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md")),
-    "director": Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md")),
     "readme": root / "README.md",
     "wrk": root / "bin/wrk",
     "policy": root / "director/gate_policy.json",
 }
 docs = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
 
-START = "<!-- T736-ASSIGNMENT-DEFAULTS -->"
-END = "<!-- /T736-ASSIGNMENT-DEFAULTS -->"
-SKILLS = ("spawn", "builder", "director")
 
 
 def flat(text: str) -> str:
@@ -59,118 +55,9 @@ def has_kimi_tomllib_import(text: str) -> bool:
     return bool(body and re.search(r"(?m)^[ \t]*import[ \t]+tomllib\b", body))
 
 
-def block(text: str, name: str) -> str:
-    assert text.count(START) == 1 and text.count(END) == 1, (
-        f"{name}: exactly one T736-ASSIGNMENT-DEFAULTS block required "
-        f"(start={text.count(START)} end={text.count(END)})"
-    )
-    return flat(text[text.index(START) : text.index(END)])
 
 
-# (row, required regex) — the negations live inside the patterns so a
-# weakened or dropped clause goes RED instead of silently matching.
-BLOCK_ROWS = [
-    # The FINAL rule sentence (note 4098): the listed pairs below are its
-    # current output, not a hard-coded list — #735 measured reps recalibrate.
-    ("rule-cost-per-task", r"과제 급 이상으로 배치된 후보 중 작업당 비용이 가장 낮은 것을 기본으로\s*고른다"),
-    ("rule-example-not-list", r"고정 목록이 아니라 이 규칙의 현재 출력"),
-    ("rule-recalibrate-735", r"#735 의 측정 rep 이? 이 표를 재보정한다"),
-    # The rule is applied by picking profile@effort explicitly — the wrk
-    # spelling defaults are NOT the policy (director-1 answer 2026-09-26).
-    ("wrk-defaults-not-policy", r"wrk 철자 기본값은? 정책이 아니다"),
-    # Builder seat: the no-max rule is repealed (hk 1864) — ultra is still
-    # refused, the wrk spelling defaults stay high or below, and under the cost
-    # rule builder candidates no longer exclude max.
-    ("builder-max-open", r"빌더 좌석의 max 런그 금지는 폐지됐다"),
-    ("cite-hk1864", r"hk 1864, 2026-10-23 운영자 결정이 09-26 4088 B 의 빌더 no-max 규칙을 대체한다"),
-    ("builder-ultra-counts", r"ultra[^\n]{0,30}?계속 거부한다"),
-    ("builder-floor", r"철자 기본값은 high 이하 또는 devin 프로필"),
-    ("builder-max-not-excluded", r"빌더 후보도 max 를 빼지 않는다"),
-    ("builder-xhigh-exceptions", r"별도 승인된 xhigh 빌더"),
-    ("builder-sol-high", r"Sol 빌더는? Sol high"),
-    # Sol high is an unmeasured (C) rung — the seat default is NOT an eligible
-    # candidate under the cost rule; the text must say so (S-R3-1).
-    ("sol-high-seat-not-candidate", r"Sol high[^\n]{0,30}?배정 후보가 아니라 좌석 고정값"),
-    ("devin-no-effort-flag", r"devin 빌더는? effort 플래그 없이"),
-    # 4088 B reservation restored with its sourced exceptions — the only
-    # non-T3 max rungs are the ones the sources name.
-    ("max-t3-only", r"max effort 는? T3 구현 워커·T3 tester 에만\s*예약한다"),
-    ("max-exceptions-sourced", r"예외는? devin swe2-max[^\n]{0,60}?A\+ 의 Luna max[^\n]{0,40}?E6 측정 런그"),
-    ("wrk-open-max", r"wrk 는 `?--role builder`? 에서 max 를 거부하지 않는다\(ultra 만 거부한다\)"),
-    ("sonnet-exception-moot", r"builder-sonnet`? 명시 `?--effort max`?[^\n]{0,60}?더 이상 예외가 아니다"),
-    # Devin defaults (unchanged by the FINAL rule).
-    ("t1t2-devin", r"T1/T2 구현 기본은 devin"),
-    ("swe2max-free", r"SWE-2 max[^\n]{0,60}?무료이므로 적극 쓴다"),
-    ("devin-sole-restriction", r"devin\(A\+\)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다"),
-    # Current output — claude (one shared weekly window: cost per task is the
-    # quota axis). Opus low carries the gate=escalation caveat.
-    ("claude-shared-window", r"하나의 주간 창을 나누므로[^\n]{0,80}?작업당 비용이 곧 쿼타 소모 비교축"),
-    ("claude-splus-opus-medium", r"S\+ = Opus medium"),
-    ("claude-t3-core-high", r"T3 코어 구현은? Opus high"),
-    ("claude-t3-tester-xhigh", r"T3 tester 는? Opus xhigh"),
-    ("claude-no-opus-max", r"Opus max 는? 쓰지 않는다"),
-    ("claude-opus-low", r"S·A\+·A =\s*Opus low"),
-    ("opus-low-dominates-sonnet", r"모든 Sonnet effort 를 비용·점수 양쪽에서 지배"),
-    ("claude-bc-haiku", r"B·C·기계적 작업 =\s*Haiku"),
-    ("opus-low-gate-escalation", r"Opus low 는? 현재 카탈로그에서 gate=escalation"),
-    ("opus-low-gate-scopefuel-only", r"scopefuel 카탈로그 변경이며[^\n]{0,30}?이 PR 의 범위 밖"),
-    # While Opus low is gated, S/A+/A still picks the cheapest USABLE
-    # candidate — no ad-hoc gap (N-R3-1).
-    ("opus-low-interim", r"해제 전까지 S·A\+·A 도 사용 가능 후보 중 비용 최소로 고른다"),
-    # The lift is a merged scopefuel change (#738) pending install — the
-    # caveat must not read as open-ended.
-    ("opus-low-738-status", r"#738[^\n]{0,25}?merge[^\n]{0,25}?설치"),
-    # The interim parenthetical pins the corrected per-grade output
-    # (S-R4-1): with Opus low gated, A's cheapest usable candidate is
-    # Sonnet low (note 4098, catalog gate=default), not Opus medium.
-    ("opus-low-interim-detail", r"그 다음 저가는 S·A\+ = Opus medium[^\n]{0,3}?A = Sonnet low"),
-    # E6 measurement rungs in the max-reservation exception list (unchanged).
-    ("worker-e6-rungs", r"워커 E6 측정 런그"),
-    # Current output — codex. Terra is dominated at every grade; the codex-sol
-    # spelling itself still defaults to max, so Sol assignments carry --effort.
-    ("codex-s-sol-xhigh", r"S\+·S = Sol xhigh"),
-    ("sol-max-t3core", r"Sol max 는?[^\n]*?T3 코어가 필요할 때만"),
-    ("codex-aplus-luna-max", r"A\+ = Luna max"),
-    ("codex-a-luna-high", r"A = Luna high"),
-    ("codex-b-luna-medium", r"B = Luna medium"),
-    ("terra-refused", r"Terra profiles are refused by operator 2026-10-12 noterra and are not assignment candidates"),
-    ("sol-codex-default-max", r"codex-sol`?\s*철자 자체의 기본값은 max"),
-    ("sol-assign-explicit-effort", r"Sol 배정은? `?--effort`? 명시"),
-    ("e6-sol-priority", r"미측정 Sol high\(C\)·미배치 Sol medium 은?[^\n]{0,40}?E6 arm 우선 측정 대상"),
-    # Provenance and authority.
-    ("cite-decision", r"2026-09-26 운영자 결정"),
-    ("cite-note-4098", r"note/2026-09-26/grade-cost-table"),
-    ("cite-telemetry", r"pinion05\.github\.io/aa-model-telemetry"),
-    ("cite-collected", r"수집 2026-09-23"),
-    ("no-bench-copy", r"벤치 수치는?"),
-    ("scopefuel-authority", r"scopefuel --recommend"),
-]
 
-# Patterns that must NOT appear anywhere in a skill file — the classes of
-# drift this test exists to catch.
-FILE_FORBIDDEN = [
-    # devin builder spellings carry the rung in the model name and are
-    # allowed (and encouraged) — builder-devin-max/builder-ds41-max are not
-    # "a builder using max" in the drift sense.
-    # hk 1864: the 09-26 closed-max builder wording is repealed and must not
-    # come back; the old drift classes (builder max "default/open") are gone
-    # with the rule they guarded.
-    ("builder-max-closed-stale",
-     r"빌더 좌석은 max 런그를 쓰지 않는다|빌더 후보는 max 를 빼고 고른다|`?--role builder`? 에서 max 를 거부한다|유일한 (?:좌석 )?예외는 #921"),
-    ("builder-max-spelling-closed-stale",
-     r"builder-(?:sonnet|sol|luna|kimi|haiku)-max[^\n]{0,40}?(?:닫혔다|닫혀 있|never takes?|are closed)|max 좌석 거부"),
-    ("devin-sole-granted",
-     r"(?:devin[^\n]{0,40}?T3|T3[^\n]{0,40}?devin)[^\n]{0,60}?단독[^\n]{0,60}?(가 된다|될 수 있다|허용|가능|쓴다|쓸 수 있다)"),
-    # Withdrawn by the FINAL rule (note 4098): Sonnet is not the T2 default —
-    # neither "T2 = Sonnet" nor "Sonnet = T2" may come back, anywhere.
-    ("sonnet-t2-stale",
-     r"T2[^\n]{0,15}?=\s*Sonnet|Sonnet[^\n]{0,25}?=\s*T2"),
-    # The contradictory replacement sentence from the first FINAL-rule edit
-    # (B-R3-1): "worker max remains only X" contradicted the same block's
-    # A+ = Luna max row. The reservation is stated as 4088 B + exceptions now.
-    ("worker-max-remnant-contradiction",
-     r"워커 쪽의 max 는[^\n]{0,60}?에만 남는다"),
-]
 
 # hk 1864: the launcher's help and comments must not claim a builder seat
 # never takes a max rung or that the max spellings are closed.
@@ -199,29 +86,9 @@ EXPLICIT_RUNG_NO_REF = (
     r"명시[^\n]{0,20}?--effort[^\n]{0,60}?--operator-request[^\n]{0,40}?요구하지 않는다"
 )
 
-OPEN_E6 = r"max 런그 철자\([^\n]*?builder-sonnet-max[^\n]*?\)는 hk 1864[^\n]*?열렸다"
 
 
 def check(d: dict) -> None:
-    for name in SKILLS:
-        blk = block(d[name], name)
-        text = flat(d[name])
-        for row, pattern in BLOCK_ROWS:
-            assert re.search(pattern, blk), f"{name}: assignment row '{row}' missing or weakened"
-        for row, pattern in FILE_FORBIDDEN:
-            assert not re.search(pattern, text), (
-                f"{name}: forbidden wording reintroduced ({row}): "
-                f"{re.search(pattern, text).group(0)!r}"
-            )
-        # No second grade table: the block must not carry a markdown table.
-        assert "|---" not in blk and "| 급 |" not in blk, (
-            f"{name}: a second grade table appeared inside the T736 block"
-        )
-        # No benchmark numbers copied into the block (dates/rungs are fine;
-        # decimal scores are not).
-        assert not re.search(r"\d+\.\d+", blk), (
-            f"{name}: benchmark-style number copied into the T736 block"
-        )
     # The launcher text must not claim a closed max-rung builder opens.
     wrk_flat = flat(d["wrk"])
     for row, pattern in WRK_FORBIDDEN:
@@ -229,23 +96,16 @@ def check(d: dict) -> None:
             f"wrk: forbidden wording reintroduced ({row}): "
             f"{re.search(pattern, wrk_flat).group(0)!r}"
         )
-    # The max-rung E6 spellings are documented as opened by hk 1864 where the
-    # rungs live.
-    for name in ("spawn", "builder"):
-        assert re.search(OPEN_E6, flat(d[name])), (
-            f"{name}: open max-rung E6 spellings note (hk 1864) missing"
-        )
-
     # #748: the stale "marked rung needs a REF" claim may not appear in any
     # scanned doc, and the corrected #716 wording must be where the rungs are
-    # documented (spawn/builder table rows, README note, wrk help).
-    for name in (*SKILLS, "wrk", "readme"):
+    # documented (README note, wrk help).
+    for name in ("wrk", "readme"):
         for row, pattern in REF_REQUIRED_FORBIDDEN:
             assert not re.search(pattern, flat(d[name])), (
                 f"{name}: stale REF-required claim reintroduced ({row}): "
                 f"{re.search(pattern, flat(d[name])).group(0)!r}"
             )
-    for name in ("spawn", "builder", "readme"):
+    for name in ("readme",):
         assert re.search(EXPLICIT_RUNG_NO_REF, flat(d[name])), (
             f"{name}: #716 explicit-rung no-REF wording missing"
         )
@@ -367,8 +227,7 @@ def check(d: dict) -> None:
 
 check(docs)
 print(
-    f"PASS assignment-defaults rows={len(BLOCK_ROWS)}/file "
-    f"forbidden={len(FILE_FORBIDDEN)}/file wrk+policy consistent"
+    "PASS assignment-defaults wrk+readme+policy consistent"
 )
 
 
@@ -409,174 +268,6 @@ def add_import_in_function(doc: dict, function: str, anchor: str, line: str) -> 
 
 
 mutants = {}
-# The two drift classes the brief names must go RED in every file, plus the
-# FINAL-rule sentence and its withdrawn Sonnet=T2 predecessor.
-for name in SKILLS:
-    mutants[f"{name}-builder-max-weakened"] = mutate(
-        name, "빌더 좌석의 max 런그 금지는 폐지됐다", "빌더 좌석은 보통 max 를 피한다"
-    )
-    mutants[f"{name}-builder-max-reintroduced"] = mutate(
-        name, "빌더 후보도 max 를 빼지 않는다", "빌더 후보는 max 를 빼고 고른다"
-    )
-    # hk 1864: restoring the repealed closed-max wording goes RED in every file.
-    mutants[f"{name}-closed-max-wording-restored"] = mutate(
-        name,
-        "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-        "빌더 좌석은 max 런그를 쓰지 않는다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    )
-    mutants[f"{name}-devin-sole-weakened"] = mutate(
-        name, "단독 구현자·단독 tester 가 되지 않는다", "단독 구현자·단독 tester 도 된다"
-    )
-    mutants[f"{name}-rule-sentence-weakened"] = mutate(
-        name, "작업당 비용이 가장 낮은 것을 기본으로", "가장 강한 모델을 기본으로"
-    )
-    mutants[f"{name}-recalibrate-735-dropped"] = mutate(
-        name, "#735 의 측정 rep 이 이 표를 재보정한다", "#735 도 이 표를 참고한다"
-    )
-    # 4088 B clauses — dropping either again is the B-R3-1 regression.
-    mutants[f"{name}-max-reservation-dropped"] = mutate(
-        name, "max effort 는 T3 구현 워커·T3 tester 에만 예약한다", "max effort 는 상황에 따라 쓴다"
-    )
-    mutants[f"{name}-builder-floor-weakened"] = mutate(
-        name, "철자 기본값은 high 이하 또는 devin 프로필이다", "철자 기본값은 xhigh 이다"
-    )
-    mutants[f"{name}-max-exceptions-dropped"] = mutate(
-        name, "예외는 devin swe2-max", "예외는 없다"
-    )
-    mutants[f"{name}-sonnet-t2-reintroduced"] = mutate(
-        name,
-        "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-        "T2 = Sonnet high.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    )
-# One-file mutants for the remaining rows.
-mutants["spawn-sonnet-t2-alt-order"] = mutate(
-    "spawn",
-    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    "Sonnet high = T2 이다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-)
-mutants["builder-max-exclusion-dropped"] = mutate(
-    "builder", "빌더 후보도 max 를 빼지 않는다", "빌더 후보도 모든 런그를 고른다"
-)
-mutants["director-sonnet-exception-restored"] = mutate(
-    "director", "더 이상 예외가 아니다", "유일한 좌석 예외다"
-)
-mutants["director-hk1864-cite-dropped"] = mutate(
-    "director", "hk 1864, 2026-10-23 운영자 결정이", "최근 운영자 결정이"
-)
-mutants["sol-max-boundary-dropped"] = mutate(
-    "builder", "Sol max 는 T3 코어가 필요할 때만", "Sol max 도 기본 후보다"
-)
-mutants["director-cite-decision-dropped"] = mutate(
-    "director", "(출처: 2026-09-26 운영자 결정", "(출처: 최근 운영자 결정"
-)
-mutants["director-cite-4098-dropped"] = mutate(
-    "director", "note/2026-09-26/grade-cost-table", "note/2026-09-26/effort-table"
-)
-mutants["spawn-no-bench-rule-dropped"] = mutate(
-    "spawn", "벤치 수치는 이 문서에 복사하지 않는다.", ""
-)
-mutants["director-wrk-open-max-dropped"] = mutate(
-    "director", "wrk 는 `--role builder` 에서 max 를 거부하지 않는다", "wrk 가 참고한다"
-)
-mutants["director-wrk-refuses-max-again"] = mutate(
-    "director",
-    "wrk 는 `--role builder` 에서 max 를 거부하지 않는다(ultra 만 거부한다)",
-    "wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다)",
-)
-mutants["terra-refusal-dropped"] = mutate(
-    "spawn",
-    "Terra profiles are refused by operator 2026-10-12 noterra and are not assignment candidates.",
-    "Terra profiles are assignment candidates.",
-)
-# A builder could read "Sol default xhigh" as the tool default and launch
-# `-m codex-sol` bare — getting max. The spelling-default warning must stay.
-mutants["sol-codex-default-warning-dropped"] = mutate(
-    "spawn",
-    "`codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다",
-    "`codex-sol` 철자로 바로 띄운다",
-)
-# The named xhigh builder exceptions keep the seat rule consistent with
-# builder-grok/builder-luna/E6 xhigh; dropping them hides the carve-out.
-mutants["xhigh-exceptions-dropped"] = mutate(
-    "builder",
-    "별도 승인된 xhigh 빌더 —\n  `builder-grok`·`builder-luna`·E6 xhigh 철자 — 는 그대로다",
-    "",
-)
-# Opus low's gate=escalation caveat is what keeps the S/A+/A default honest —
-# lifting it is a scopefuel catalog change, not this PR.
-mutants["opus-low-gate-dropped"] = mutate(
-    "spawn", "Opus low 는 현재 카탈로그에서 gate=escalation 이라 아직 그대로 못 쓴다", "Opus low 도 바로 쓸 수 있다"
-)
-mutants["opus-low-scope-caveat-dropped"] = mutate(
-    "builder", "scopefuel 카탈로그 변경이며", "임의로 고쳐도 되며"
-)
-mutants["e6-sol-priority-dropped"] = mutate(
-    "spawn", "E6 arm 우선 측정 대상", "E6 측정 대상이 아니다"
-)
-mutants["claude-shared-window-dropped"] = mutate(
-    "builder", "하나의 주간 창을 나누므로", "각각 별개의 주간 창이므로"
-)
-mutants["claude-splus-to-opus-max"] = mutate(
-    "director", "S+ = Opus medium", "S+ = Opus max"
-)
-mutants["claude-t3-tester-weakened"] = mutate(
-    "spawn", "T3 tester 는 Opus xhigh", "T3 tester 는 Opus low"
-)
-mutants["luna-max-downgraded"] = mutate(
-    "builder", "A+ = Luna max", "A+ = Luna low"
-)
-mutants["claude-opus-low-dropped"] = mutate(
-    "director", "Opus low**(모든 Sonnet", "Sonnet high**(모든 Sonnet"
-)
-mutants["no-opus-max-dropped"] = mutate(
-    "builder", "Opus max 는 쓰지 않는다", "Opus max 도 쓴다"
-)
-# "wrk spelling defaults are not the policy" is what keeps the kept-at-high
-# builder defaults from being read as the cost-rule mapping.
-mutants["wrk-defaults-as-policy"] = mutate(
-    "director", "wrk 철자 기본값은\n  정책이 아니다", "wrk 철자 기본값이 곧 정책이다"
-)
-mutants["builder-sol-high-dropped"] = mutate(
-    "spawn", "Sol 빌더는 Sol high(wrk 기본값 그대로", "Sol 빌더는 상황에 따라"
-)
-# The Sol-high-is-not-a-candidate caveat keeps the seat default from being
-# read as grade eligibility (S-R3-1).
-mutants["sol-high-seat-caveat-dropped"] = mutate(
-    "builder", "자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다", "자체는 이미 측정된 S 후보다"
-)
-# While Opus low is gated the interim "cheapest usable" clause prevents
-# ad-hoc S/A+/A picks (N-R3-1).
-mutants["opus-low-interim-dropped"] = mutate(
-    "director", "해제 전까지 S·A+·A 도 사용 가능 후보 중 비용 최소로 고른다\n  (현재 그 다음 저가는", ""
-)
-# The #738 merge status keeps the gate caveat from reading as an
-# open-ended block (director-1: merged, installing soon).
-mutants["opus-low-738-dropped"] = mutate(
-    "spawn", "scopefuel #738 에서 merge 됐고 설치 예정이다(scopefuel 카탈로그 변경이며", "언젠가 해제될 것이다(scopefuel 카탈로그 변경이며"
-)
-# The interim detail pins the corrected per-grade output (S-R4-1): A's
-# cheapest usable candidate is Sonnet low, not Opus medium.
-mutants["opus-low-interim-detail-wrong"] = mutate(
-    "builder", "S·A+ = Opus medium·A = Sonnet low", "S·A+·A = Opus medium"
-)
-# E6 measurement rungs are worker-side — builder max stays closed (N-R4-1).
-mutants["worker-e6-rungs-dropped"] = mutate(
-    "director", "워커 E6 측정 런그다(#704)", "빌더 E6 측정 런그다(#704)"
-)
-# The contradictory "worker max remains only ..." sentence must not come
-# back — only the forbidden guard catches this class.
-mutants["worker-max-remnant-back"] = mutate(
-    "director",
-    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    "워커 쪽의 max 는 Sol 의 T3 코어 필요분과 E6 측정 런그에만 남는다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-)
-# Forbidden-pattern mutants (tester round-1 classes): these only the guard
-# catches — every required row still reads the same.
-mutants["devin-sole-permission-no-tag"] = mutate(
-    "director",
-    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    "T3 tester 로 devin-swe2-max 단독 배정을 허용한다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-)
 mutants["wrk-help-max-closed-back"] = mutate(
     "wrk",
     "were closed by that decision;",
@@ -586,32 +277,6 @@ mutants["wrk-help-max-closed-list-back"] = mutate(
     "wrk",
     "builder-kimi-max,\n                     builder-haiku-max) are open builder\n                     seats since hk 1863 (the 2026-09-26 no-max refusal is\n                     removed)",
     "builder-kimi-max,\n                     builder-haiku-max) are closed builder\n                     seats (the 2026-09-26 no-max refusal is\n                     removed)",
-)
-mutants["telemetry-citation-dropped"] = mutate(
-    "builder", "`pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23", ""
-)
-mutants["t1t2-devin-dropped"] = mutate(
-    "spawn", "T1/T2 구현 기본은 devin 이다", "T1/T2 는 상황에 따라 배정한다"
-)
-mutants["swe2max-free-dropped"] = mutate(
-    "spawn", "무료이므로 적극 쓴다", "무료다"
-)
-mutants["scopefuel-authority-dropped"] = mutate(
-    "director", "scopefuel --recommend", "추천 도구"
-)
-mutants["second-grade-table-added"] = mutate(
-    "builder",
-    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-    "| 급 | 작업 |\n|---|---|\n| S | 구현 |\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
-)
-mutants["benchmark-number-copied"] = mutate(
-    "spawn", "측정되면 S 후보.", "측정되면 S 후보. Sol 점수 82.4."
-)
-mutants["open-e6-note-dropped"] = mutate(
-    "spawn", "로 열렸다 — 다른 E6 런그와 같이", "는 측정 전용이다 — 다른 E6 런그와 같이"
-)
-mutants["closed-e6-note-restored"] = mutate(
-    "builder", ")는 hk 1864(", ")는 닫혔다 (hk 1864 "
 )
 mutants["wrk-seat-rule-removed"] = mutate(
     "wrk",
@@ -753,18 +418,6 @@ mutants["wrk-seat-rule-awk-overrides-quote"] = mutate(
     'sub(/\\.overrides$/, "", mh)',
     'sub(/[."]?\\.overrides.*$/, "", mh)',
 )
-# #748: the stale "marked rung needs a REF" claim must go RED in every
-# scanned doc; dropping the corrected wording goes RED via the required row.
-mutants["builder-ref-required-back"] = mutate(
-    "builder",
-    "`--operator-request` REF를\n요구하지 않는다",
-    "`--operator-request`가 추가로\n필요하다",
-)
-mutants["spawn-ref-required-back"] = mutate(
-    "spawn",
-    "`--operator-request` REF를 요구하지 않는다",
-    "`--operator-request`가 추가로 필요하다",
-)
 mutants["readme-ref-required-back"] = mutate(
     "readme",
     "`--operator-request` REF를 요구하지 않는다",
@@ -774,11 +427,6 @@ mutants["wrk-ref-required-back"] = mutate(
     "wrk",
     "so no --operator-request REF is enforced there",
     "additionally need --operator-request REF",
-)
-mutants["builder-explicit-no-ref-dropped"] = mutate(
-    "builder",
-    "`--operator-request` REF를\n요구하지 않는다",
-    "`--operator-request` REF를\n요구한다",
 )
 mutants["wrk-builder-sol-back-to-max"] = mutate(
     "wrk",
