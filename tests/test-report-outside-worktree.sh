@@ -71,9 +71,9 @@ def check_collect(text: str) -> None:
     assert re.search(r"harvest it from the pane first if not — a closed pane loses it", step), (
         "a missing report must be harvested before the pane is reaped"
     )
-    assert "reap" not in step[: step.index("harvest it from the pane first")], (
-        "harvest must come before any reap"
-    )
+    before = step[: step.index("harvest it from the pane first")]
+    assert "reap" not in before, "harvest must come before any reap"
+    assert "close the hk task" not in before, "the report check must come before closing the task"
 
 
 def check(text: str) -> None:
@@ -108,8 +108,11 @@ mutants = {
     "collect-harvest-dropped": mutate(
         " (harvest it from the pane first if not — a closed pane loses it)", ""),
     "collect-reap-before-harvest": mutate(
-        "check the report exists at its path outside\n   the worktree (harvest it from the pane first if not — a closed pane loses it), then reap",
-        "reap, then check the report exists at its path outside\n   the worktree (harvest it from the pane first if not — a closed pane loses it), then reap"),
+        "check the report exists at its path outside the worktree",
+        "reap, then check the report exists at its path outside the worktree"),
+    "collect-task-closed-before-report": mutate(
+        "check the report exists at its path outside the worktree",
+        "close the hk task, check the report exists at its path outside the worktree"),
 }
 for name, doc in mutants.items():
     try:

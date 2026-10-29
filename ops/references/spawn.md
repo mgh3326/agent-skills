@@ -30,7 +30,8 @@
 
 ## 4. 기동·주입·감시
 
-- 기동은 **`wrk spawn`** 우선(worktree+탭+기동+주입 원샷):
+- 기동은 위 launcher 규칙을 따른다 — **`runtug spawn`** 이 기본, 도구 사유로 거부될 때만 같은 인자로
+  `wrk spawn`(worktree+탭+기동+주입 원샷). 아래 예시와 옵션 설명은 `wrk` 철자다:
   ```bash
   wrk spawn -c <worktree> -m <프로필> -p <프롬프트파일> -w <워크스페이스> -l <라벨> \
             --t <T0..T3> --owner <내 세션 이름> [-L live|mock] [--effort <레벨>] [--job <id>]

@@ -52,7 +52,8 @@ herdr pane close <pane_id>                      # 회수
 herdr pane list → 해당 workspace pane 전수
 분류:
   ① 살아 있는 에이전트 pane (agent list 와 대조)     → §6-2/6-3 규칙대로
-  ② terminal_title 이 셸 프롬프트(mgh3326@…)          → 죽은 탭. 닫는다
+  ② terminal_title 이 셸 프롬프트(<user>@…)          → 죽은 탭 후보. 그 pane 의 job 이 terminal 이고
+                                                         보고서가 지정 경로에 있을 때만 닫는다. 아니면 둔다
   ③ 그 외 (판별 불가)                                 → 화면을 읽고 판단
 ```
 - 스폰이 실패하면 job 디렉토리(`jobs/<id>/spawn-failure-screen.txt`)에 실패 pane 의
@@ -79,7 +80,7 @@ wrk reap --lane <내 세션 이름> --apply      # 실제 회수
 그 **뒤에** `job.claim`·`job.reclaim`·`job.spawned`·`job.reprompted` 가 없고(끝난 뒤 다시 잡힌
 잡은 살아 있는 작업 — `reason=reclaimed-after-terminal`), 그 이벤트가 `--grace`(기본 10m)보다
 오래됐고, **가장 늦은** `job.spawned` 영수증의 pane 이 herdr 에 살아 있고 상태가 `idle`·`done`
-이고, herdr 가 말하는 그 pane 의 탭이 기록된 탭과 같고(`reason=tab-mismatch`), close 직전에 다시
+이고, claim·reclaim·spawn 영수증에 `keep: true`(`wrk spawn --keep`)가 없고(`reason=protected`), herdr 가 말하는 그 pane 의 탭이 기록된 탭과 같고(`reason=tab-mismatch`), close 직전에 다시
 읽은 `herdr tab list` 가 그 탭의 pane 을 **정확히 1개로 확인**하고(조회 실패·파싱 실패·탭 누락·
 비정수는 닫지 않는다 — `reason=tab-count-unknown`), 아직 `job.reaped` 가 없을 것. 🔴 `--apply` 는 `--lane` 없이
 거부된다(전역 회수 금지). `working`·`blocked` pane, terminal

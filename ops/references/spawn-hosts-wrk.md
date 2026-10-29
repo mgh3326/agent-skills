@@ -6,7 +6,7 @@
 
 - **스폰**은 원격 herdr 서버에서 현지 `wrk` 로 한다(패턴 고정):
   ```bash
-  ssh <host> 'export PATH=$HOME/.local/bin:$PATH HERDR_SESSION=worker; wrk spawn -c <path> -m <프로필> -p <프롬프트파일> -w w1 -l <라벨> --t <T> --owner <내 세션> --job <id>'
+  ssh <host> 'export PATH=$HOME/.local/bin:$PATH HERDR_SESSION=<호스트 세션>; wrk spawn -c <path> -m <프로필> -p <프롬프트파일> -w w1 -l <라벨> --t <T> --task <hk task id> --owner <내 세션> --job <id>'
   ```
   호스트별 세션명: ncp=`operator`, rpi/desktop/m1=`worker`. 프롬프트 파일은 먼저 `scp` 로 올린다.
 - **확인·조작**은 로컬 사이드바의 미러 워크스페이스(`ncp: sessions`, `rpi: ~`, `m1: ~` …)에서

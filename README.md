@@ -67,7 +67,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
-| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음 |
+| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — 정본은 `ops/references/deploy.md`(operator-desk 직속, 스폰·보고 모두 operator-desk), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음. 이 스킬 디렉토리는 은퇴 예정 |
 
 구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
 
