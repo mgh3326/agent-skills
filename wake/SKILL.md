@@ -38,7 +38,16 @@ plentiful; non-urgent work may wait for SWE-2.
 
 ## The loop
 
-1. **Task.** Ensure the hk task exists with the title marker and tags. One task = one PR.
+1. **Task.** Create the hk task with the title marker, tags and an expected duration
+   (2h small fix, 6h normal feature, 1d large). One task = one PR.
+   ```sh
+   handoffkeep tasks add --project <project> --title '<title> (grade <G>, <T>)' \
+     --priority <n> --expected <duration>
+   ```
+   The expected duration drives the quota-stop rule: a pane stopped on quota waits if the
+   reset falls within it, otherwise the task is handed over (1d when absent).
+   The server field ships with the next hk deploy; until then `--expected` may be refused —
+   create the task without it and record `Expected: <duration>` as a task comment.
 2. **Worktree.**
    ```sh
    git -C ~/work/<repo> fetch
@@ -115,6 +124,7 @@ Copy, fill every `<…>`, delete nothing else.
 # Brief — <repo>: <title> — hk task <id>
 
 Worktree: ~/work/<repo>.<slug> (branch wk/<slug>, base origin/main). Grade <G>, <T>.
+Expected: <duration>  (hk task --expected; quota stops wait only if the reset falls within it)
 
 ## Do
 <numbered instructions>
