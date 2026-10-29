@@ -37,6 +37,7 @@ suites-b|bash tests/test-ci-suites.sh
 suites-b|bash tests/test-ci-any-ref.sh
 suites-b|bash tests/needs-full-macos.sh
 python|python3 -m unittest tests/test_pa_review_scan.py -v
+python|python3 -m unittest tests/test_arbiter_quota_bin.py -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v

@@ -649,11 +649,13 @@ def scopefuel_bin() -> str:
     explicit = os.environ.get("SCOPEFUEL_BIN") or ""
     if explicit:
         return explicit
-    found = shutil.which("scopefuel")
+    # scopefuel 은 퇴역(2026-10-30). pacelever 가 같은 scopefuel.v1 --json 과
+    # gate 를 낸다. 이름이 scopefuel 인 실행 파일은 구버전 호환으로만 찾는다.
+    found = shutil.which("pacelever") or shutil.which("scopefuel")
     if not found:
         raise ArbiterError(
             EXIT_STORAGE,
-            "scopefuel 을 찾을 수 없다 — quota pool 정본이 없으면 lease 를 발급하지 않는다",
+            "pacelever(또는 scopefuel) 를 찾을 수 없다 — quota pool 정본이 없으면 lease 를 발급하지 않는다",
         )
     return found
 
