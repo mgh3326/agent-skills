@@ -62,6 +62,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `director` | 운영자 직속 최상위 역할 — 머지·배포·큐 권한, 빌더 브리프·스폰·독립 검증 판정 |
 | `checker` | director 보좌·사전 머지 검사 역할 — 릴레이 수신, 셀 수 있는 게이트·큐·레인 정리 |
 | `builder` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
+| `wake` | repo 세션의 PR 루프(wake method) — 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드·director 경로 없음, 워커 브리프 템플릿 포함 |
 | `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
