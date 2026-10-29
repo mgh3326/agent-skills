@@ -21,7 +21,7 @@ on:
         default: ''
         type: string
       suite:
-        description: Which suites to run (all, lint, wrk, suites-a, suites-b, python, macos-smoke)
+        description: Which suites to run (all, lint, suites-a, suites-b, python, macos-smoke)
         required: false
         default: all
         type: string
@@ -55,39 +55,20 @@ jobs:
           fi
       - name: ShellCheck
         run: |
-          shellcheck bin/wrk tests/test-wrk.sh tests/wrk_spillover.sh \
-            tests/test-followup-injection.sh \
+          shellcheck tests/test-followup-injection.sh \
             tests/test-report-outside-worktree.sh \
-            tests/test-model-contract-guard.sh \
             tests/test-installer-route.sh \
             tests/test-installer-deploy-record.sh \
-            tests/test-prompt-suggestion-off.sh \
-            tests/test-resume-settings.sh \
             tests/test-untagged-operator-evidence.sh \
             tests/test-event-monitor-doc.sh \
             tests/test-decision-request-doc.sh \
             tests/test-input-line-not-evidence.sh \
             tests/test-ops-wake-contract.sh \
             tests/test-install-prune.sh \
-            tests/test-tester-eligible.sh \
-            tests/test-assignment-defaults.sh \
-            tests/test-merge-precheck.sh \
-            tests/test-round-cap.sh \
-            tests/test-wrk-rounds.sh \
-            tests/test-wrk-heavy-limit.sh \
-            tests/test-wrk-heavy-class.sh \
-            tests/test-wrk-task-link.sh \
-            tests/test-wrk-job-end.sh \
             tests/test-fleet-rev.sh \
-            tests/test-gate-policy-devin-grades.sh \
-            tests/test-codex-project-trust.sh \
             tests/test-area-propose.sh \
             tests/test-ci-suites.sh \
             tests/test-ci-any-ref.sh \
-            tests/test-wrk-artifacts-move.sh \
-            tests/test-wrk-artifacts-routing.sh \
-            tests/test-wrk-artifacts-sweep.sh \
-            tests/test-wrk-artifact-prune.sh \
             tests/needs-full-macos.sh \
             scripts/needs-full-macos \
             scripts/resolve-ci-ref \
@@ -96,18 +77,8 @@ jobs:
             tests/fixtures/fleet-rev/panewire \
             tests/fixtures/fleet-rev/handoffkeep \
             tests/fixtures/fleet-rev/go \
-            tests/fixtures/arbiter-legacy \
-            tests/fixtures/arbiter-proxy \
-            tests/fixtures/cmd \
             tests/fixtures/herdr \
-            tests/fixtures/panewire \
-            tests/fixtures/pi \
-            tests/fixtures/scopefuel \
-            tests/fixtures/spillover-herdr \
-            tests/fixtures/spillover-hub-curl \
-            tests/fixtures/spillover-panewire \
-            tests/fixtures/spillover-scp \
-            tests/fixtures/spillover-ssh
+            tests/fixtures/scopefuel
 
   changes:
     name: changes
@@ -130,10 +101,10 @@ jobs:
           SUITE: ${{ inputs.suite || 'all' }}
         run: |
           case "$SUITE" in
-            all)         SHARDS='["wrk","suites-a","suites-b","python"]'; SMOKE=true ;;
+            all)         SHARDS='["suites-a","suites-b","python"]'; SMOKE=true ;;
             lint)        SHARDS='[]'; SMOKE=false ;;
             macos-smoke) SHARDS='[]'; SMOKE=true ;;
-            wrk|suites-a|suites-b|python) SHARDS="[\"$SUITE\"]"; SMOKE=false ;;
+            suites-a|suites-b|python) SHARDS="[\"$SUITE\"]"; SMOKE=false ;;
             *) echo "unknown suite: $SUITE" >&2; exit 1 ;;
           esac
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
@@ -152,7 +123,7 @@ jobs:
 
           base_sha, head_sha, repository, branch, current_run, changed_file = sys.argv[1:]
           required = {
-              "lint", "ubuntu (wrk)", "ubuntu (suites-a)", "ubuntu (suites-b)",
+              "lint", "ubuntu (suites-a)", "ubuntu (suites-b)",
               "ubuntu (python)", "macos-smoke", "ci-ok",
           }
 
@@ -258,7 +229,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.shard }}" == python ]]; then
-            CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+            CI_PY_TMP="$(mktemp -d /tmp/ci-py.XXXXXX)"
             mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
             export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
             export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
@@ -266,14 +237,7 @@ jobs:
             export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
             export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
             export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
-            cleanup_python_shard() {
-              local original_rc=$? cleanup_rc=0
-              . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
-              TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
-              if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
-              exit "$original_rc"
-            }
-            trap cleanup_python_shard EXIT
+            trap 'rm -rf "$CI_PY_TMP"' EXIT
           fi
           while IFS='|' read -r shard command; do
             [[ -n "$shard" && "$shard" != \#* ]] || continue
@@ -327,7 +291,7 @@ jobs:
           while IFS='|' read -r shard command; do
             [[ -n "$shard" && "$shard" != \#* ]] || continue
             if [[ "$shard" == python && -z "${CI_PY_TMP:-}" ]]; then
-              CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+              CI_PY_TMP="$(mktemp -d /tmp/ci-py.XXXXXX)"
               mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
               export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
               export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
@@ -335,14 +299,7 @@ jobs:
               export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
               export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
               export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
-              cleanup_python_shard() {
-                local original_rc=$? cleanup_rc=0
-                . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
-                TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
-                if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
-              exit "$original_rc"
-              }
-              trap cleanup_python_shard EXIT
+              trap 'rm -rf "$CI_PY_TMP"' EXIT
             fi
             echo "::group::$shard: $command"
             bash -c "$command"
@@ -382,7 +339,7 @@ jobs:
             case "$SUITE" in
               lint) ;;
               macos-smoke) EXPECTED="$MACOS_SMOKE" ;;
-              wrk|suites-a|suites-b|python) EXPECTED="$UBUNTU" ;;
+              suites-a|suites-b|python) EXPECTED="$UBUNTU" ;;
               *) echo "ci-ok failed: unknown suite $SUITE" >&2; exit 1 ;;
             esac
             if [[ "${EXPECTED:-success}" != success ]]; then

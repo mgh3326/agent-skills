@@ -1,7 +1,7 @@
 # agent-skills — 크로스에이전트 오케스트레이션 스킬 정본
 
 멀티에이전트 오케스트레이션(herdr 대장-워커 체계)에서 반복되는 절차를 SKILL.md 포맷으로
-표준화하고, 스폰 게이트(`wrk`)와 admission control(`arbiter`)까지 도구로 구현한 묶음이다.
+표준화하고, admission control(`arbiter`)까지 도구로 구현한 묶음이다.
 기반 도구는 [herdr](https://github.com/herdrdev/herdr)(세션 스폰·주입·감시),
 [worktrunk](https://github.com/max-sixty/worktrunk)(worktree 관리),
 [scopefuel](https://github.com/mgh3326/scopefuel)(쿼타·급 판단) — 전부 공개 repo다.
@@ -25,8 +25,7 @@ mutation 등)의 구체 사례에서 뽑아 도메인 무관 형태로 추상화
 (`spawn-worker.md`·`relay-handoff.md`·`linear-archive.md`)는 더 이상 읽히지 않는다 — `ops.md`로 합친다.
 `AGENT_SKILLS_DOMAIN` 미설정이나 해당 디렉토리 부재는 정상 상태다(추상 규칙만 적용) —
 경고 없음. `./install.sh --check`가 오버레이 설정 여부를 한 줄로 보여준다. 같은
-검사에서 `bin/wrk`의 `PROFILE_KIND`에서 에이전트 CLI를 파생해 설치 여부를 표시하고,
-`scopefuel`의 캐시된 풀별 인증·쿼타 요약도 보여준다. 캐시가 없으면 빠르게 미측정으로
+검사에서 `scopefuel`의 캐시된 풀별 인증·쿼타 요약도 보여준다. 캐시가 없으면 빠르게 미측정으로
 넘어가며, 실측이 필요할 때만 `./install.sh --check --probe`를 사용한다.
 
 ## 스킬 목록
@@ -48,7 +47,7 @@ relay-handoff → `ops/references/relay.md`(+`session-questions.md`), consult-ad
 installer → `deploy.md`(+`deploy-checklist.md`), spawn-worker §4·§4.x·§6 → `spawn.md`·`spawn-hosts.md`·
 `heavy.md`·`reap.md`, director 결정 요청·감시 → `decision-request.md`·`watching.md`·`panewire-events.md`,
 spawn-worker §1~§3·builder 루프·director 권한·머지 게이트 → `wake`. planner·architect·linear-archive·node-ops·
-checker와 tester 라운드 규칙은 옮기지 않았다. `director/`의 게이트 스크립트·정책 파일은 Phase B까지 남는다.
+checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의존하던 `director/` 게이트(tester-eligible·merge-precheck)는 runtug 로 대체되며 삭제됐다. `director/gate_policy.json` 은 `local_sources` 해시 핀(ci.yml docs-only 분류기와 wake 가 읽음)만 남겼다.
 원문 복원: `git log --diff-filter=D --format=%H -1 -- <스킬>/SKILL.md`로 삭제 커밋을 찾고
 `git show <그 커밋>^:<스킬>/SKILL.md`.
 
@@ -69,11 +68,10 @@ checker와 tester 라운드 규칙은 옮기지 않았다. `director/`의 게이
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
-| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부; #965 — hosts.toml `[hub] session_machine_ids`에 매핑된 세션의 worker 스폰은 `panewire lanes add`로 허브 레인을 등록하고 OK 줄에 `lane=`을 단다. #994 — `session_machine_ids`는 non-fleet herdr 세션 전용이다(예: M1의 기본 세션). fleet 세션을 매핑하면 모든 fleet worker가 global lane으로 등록되므로 지원하지 않는다. #1037 — `[hub] lanes_token_env`(이 호스트 머신의 노드 토큰 파일)를 두면 lanes add/ls/rm만 그 credential을 쓰고 quota gate는 켜지지 않는다 — 게이트 opt-in은 `hub_token_env`뿐이다. #1138 — `hub_url`이 있고 `hub_token_env`가 없는 `[hub]`는 매 spawn마다 "hub quota gate skipped (local scopefuel gate only)" 경고를 한 번 stderr에 출력하고, `quota_gate = "local"`을 두면 경고 없이 같은 local-only 경로를 탄다(lanes-only 호스트용 명시적 opt-out; 다른 값이나 `hub_token_env`와의 병존은 rc 70 설정 오류). #1397 — `--role builder` 스폰도 `--lane`/`--parent`로 허브 레인을 등록한다(머신은 session map → 없으면 `[hub] machine_id` 폴백, builder 레인의 자격증명은 `lanes_token_env`→`operator_token_env`→`hub_token_env`이고, worker 레인은 #965 때와 같은 `lanes_token_env`→`hub_token_env` 체인을 유지한다(worker는 operator_token_env를 절대 읽지 않는다 — 등록과 reap 양쪽에서, `reap --apply`는 job의 claim role로 그쪽 체인을 고른다); OK 줄은 `lane=..@..` 또는 `lane=UNREGISTERED`, `WRK_LANE_STRICT=1`이면 미등록 시 rc 82; 원격 `--host` builder 스폰은 실행 호스트가 `--lane-defer`로 receipt에만 기록하고 ssh 시작 호스트가 원격의 OK 줄이 있고 pane이 남는 rc(0·76)로 답할 때 `lanes add`를 치는데 — add가 건너뛰거나 실패하면 `lane=UNREGISTERED`로 다시 쓴다, 이때 machine 은 session map 이나 `[hub] machine_id`가 아니라 그 호스트의 hosts.toml 키다 — 원격 worker는 이 경로를 타지 않고 실행 호스트 자신의 session map을 따른다. 원격 builder 레인의 `reap --apply`는 실행 호스트가 lanes credential을 들고 있을 때만 지운다 — 없으면 경고 후 행이 남는다(step-4 머신 스코프 토큰 전까지의 공백). deferred receipt 쓰기 실패는 pane을 닫지만 hk task claim/link는 receipt보다 먼저 일어나므로 task는 미실행 job에 묶인 채 남는다) · `reap`(끝난 pane 회수, 기본 dry-run; `--apply`는 등록된 허브 레인도 `panewire lanes rm`으로 거둔다 — 잔여분은 `panewire lanes-audit`이 나열) · `lanes-missing`(읽기 전용: `owner_lane`이 기록된 열린 job 전부 — worker 포함 — 의 레인이나 그 parent가 `panewire lanes ls`에 없는 것을 나열, #1397) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정) · `heavy`(>1분 로컬 실행의 호스트 직렬화 락, `-- <cmd>`·`status`). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 | `fleet-rev` | 5호스트 설치 버전 점검(**읽기 전용**) — 호스트별 scopefuel·agent-skills·panewire·handoffkeep의 설치 커밋을 GitHub main과 대조해 current/behind/diverged를 표로 출력. 호스트당 ssh 1회 + 고정 POSIX sh probe(key=value만 출력); 설치·재시작·쓰기 명령 없음. `--extra NAME=ALIAS` · `--skip NAME` · `--only NAME[,NAME]` · `--timeout` · `--json` |
 
-Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and writes a receipt. Usage and audit: [director/tester-eligible.md](director/tester-eligible.md).
+> `wrk`(세션 스폰·reap·heavy CLI)는 runtug 로 대체되어 은퇴했다(hk 2323). runtug 는 `~/.config/wrk/hosts.toml` 을 그대로 읽는다.
 
 ## 의존 도구
 
@@ -82,15 +80,13 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 | `herdr` (`~/.local/bin/herdr`) | 세션 스폰·주입·감시 — **하드 의존** | 없음 (스킬 자체가 herdr 체계용) |
 | `scopefuel` | 스폰 전 쿼타·pace 확인, 급별 후보 추천(`--recommend`), 스폰 게이트(`gate`) | 없음(정본) |
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
-| `~/bin/herdr-spawn` | **deprecated** — `wrk spawn` 으로 위임하는 shim(옛 경로 호환용) | `wrk spawn` |
 
 ## Local ShellCheck
 
-Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. On pi and oci, use `--changed origin/main` for an advisory check of changed `bin/wrk` functions; this compares the merge base with the working tree, so uncommitted edits are included. The selected functions are checked with the working-tree contents and without their full-file context. Leave the full `bin/wrk` check to CI. CI continues to run its existing direct ShellCheck step.
+Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. The `--changed` mode only knows `bin/wrk`, which was retired, so it no longer selects anything. CI continues to run its existing direct ShellCheck step.
 
 ```sh
-scripts/shellcheck-capped tests/test-wrk.sh
-scripts/shellcheck-capped --changed origin/main -- bin/wrk tests/test-wrk.sh
+scripts/shellcheck-capped tests/test-ci-suites.sh
 ```
 
 ## 설치 점검 (fleet-rev)
@@ -145,335 +141,18 @@ exit code: `0` 전부 current · `1` behind/diverged 하나라도 있음 ·
 - **handoffkeep**: CLI 설치 절차는 handoffkeep repo에 문서화되어 있지 않다
   (repo에는 서버용 `deploy/systemd/` 유닛과 `docs/README.md` 운영 절차만 있다).
 
-## `wrk` 사용법
-
-```text
-wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3 --task HK_TASK_ID
-          [-L live|mock] [--effort LEVEL] [--job ID]
-wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE --task HK_TASK_ID ... -m builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi
-wrk done JOB [--report PATH]
-wrk escalate JOB --question TEXT [--report PATH]
-wrk joined JOB --pr URL --head SHA --report PATH
-wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders]
-wrk find <이름|라벨> [--pane-only]
-wrk name-sync [--apply|<라벨>...]
-wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트(hosts.toml [local] heavy_load_wait=false면 그 대기만 생략)
-wrk heavy status       # 보유자·대기열·load_wait 상태
-```
-
-`-m`은 필수이며 `codex-luna`, `codex-sol`처럼 모델을 드러내는 canonical 이름과
-기존 허용 codex 별칭을 함께 지원한다. `codex-terra`, `codex-terra-max`, `codex-med`와
-`builder-terra-*`는 gpt-5.6-terra가 금지되어 operator 2026-10-12 noterra에 따라
-spawn이 거부된다. 쿼터 판정은 설치된
-`scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
-`agy -p "$(cat PROMPT_FILE)"`이다.
-
-`-L mock`은 MOCK_MCP_PROFILE과 WRK_MOCK_MCP_CONFIG의 명시적 stdio 연결을 요구한다.
-실제 세션이 로드한 연결과 도구 목록을 검사하며, 격리를 증명할 수 없는 하네스·충돌 설정·원격
-스폰은 exit 79로 거부한다. 설정 경로, 지원 범위, fake 검증과 운영자 활성화 절차는
-[mock MCP isolation runbook](docs/mock-mcp-isolation.md)을 따른다.
-
-Codex auto_trader를 필요한 trusted 프로젝트에만 연결하는 Q-41 이전은
-[project MCP runbook](docs/codex-project-mcp.md)의 render-only planner와 reviewed
-registry를 사용한다. 제안 파일만 만들며, merge 후 desk가 설정과 trust를 검토하고 적용한다.
-
-`--task <hk task id>`는 **모든 스폰이 묶이는 handoffkeep task**다(#768,
-decision/2026-09-27/task-job-linkage 항목 1 — 신규 스폰만, 기존 잡 백필 없음).
-`--role builder`와 `--role worker`에 필수이고 빠뜨리면 어떤 부작용보다 먼저
-usage 에러로 죽는다. tester·자문 세션은 `--task` 대신 부모 잡의 task를
-상속한다 — `--parent-job <job>`을 주거나, 스폰한 pane 안에서 호출하면 그 pane의
-`ARBITER_JOB` claim 메타 → `HK_TASK_ID` 환경 순으로 해석된다(모든 스폰된
-pane에는 `HK_TASK_ID`가 실린다). 스폰이 성공했을 때만 hk에 쓴다:
-`tasks claim <id> --by <라벨> --job-id <job>` 한 번에 claim과 `refs.job_id`
-바인딩이 함께 떨어지고, 응답에서 두 값을 검증한다(`--job-id`를 무시하는 옛
-handoffkeep은 조용한 반쪽 기록이 아니라 스폰 실패로 드러난다). 스폰 실패는
-hk를 건드리지 않는다. 다른 잡에 묶인 task, 잡 없이 claim만 된 남의 task,
-merged/dropped/hold/needs_decision 상태는 전부 fail-closed다. handoffkeep이
-안 닿으면 스폰을 거부한다 — `task_link_override`로 잡 메타에 기록되는
-`--task-hk-bypass`만이 그 거부를 뚫는다.
-
-새 탭의 셸이 아직 rc 파일을 실행 중이면(부하가 높을 때 수 초) herdr는 `agent start`를
-`agent_pane_busy`로 거부한다. `wrk`는 그 코드에 한해 프로필의 start 창(기본 30초, codex
-120초 등) 안에서 0.25초 간격으로 재시도하고, 매 시도에 창의 남은 시간을 `--timeout`으로
-넘긴다. 남은 시간이 herdr 하한(3000ms) 이하이거나 시도 상한(창/250ms)에 닿으면 빈 pane을
-닫고 쿼터 기록을 해제하는 기존 fail-closed로 끝난다. 다른 오류 코드는 재시도하지 않는다.
-Devin은 `pane run`이 셸 상태를 확인하지 않고, `agent start`의 agent_pane_busy 게이트는
-바로 그 foreground 검사이므로, 어떤 kind든 agent argv를 넣기 전에 `pane process-info`를
-같은 간격으로 조회해 셸이 foreground를 혼자 가진 상태(herdr의 available-shell 규칙)를
-기다린다. foreground만으로는 부족하다 — rc 파일이 `read -k 1` 같은 한 글자 입력에 멈춰
-있어도 zsh는 foreground를 혼자 갖는다(Pi에서 oh-my-zsh 업데이트 프롬프트가 타이핑된
-`devin`의 d를 삼켜 `evin`이 실행된 사고; 다른 kind이면 herdr가 타이핑하는 argv의 첫
-글자가 삼켜진다). 그래서 셸이 foreground를 혼자 잡으면 devin의 `pane run`이든 다른
-kind의 `agent start`든 그 argv를 넣기 전에 공백으로 시작하는 `printf` 프로브(매번 새
-nonce)를 타이핑하고, 그 토큰이 자기 출력 줄로 정확히 돌아올 때만 진행한다 — 에코된
-명령 줄은 증거가 아니다. 이 spawn이 타이핑한 토큰 중 아무 것이나 돌아오면 된다 —
-아직 sourcing 중인 rc 뒤에 queue된 줄은 프롬프트가 올 때 모두 실행되고, `read -k 1`이
-선행 공백을 삼켜도 나머지 줄은 그대로 실행된다. 프로브에 답이 없으면 새 토큰으로
-재타이핑할 뿐 절대 ctrl+c 등 키를 보내지 않는다 — sourcing 중인 rc에 대한 SIGINT는
-나머지 rc를 죽여 agent가 잘린 환경을 물려 받는다. 창이 닫힐 때까지 답이 없으면 자체
-사유로 fail-closed하고 pane을 닫으며 `agent start`도 호출하지 않는다. 이 대기는 뒤의
-검출·idle 대기(Devin) 또는 `agent start` 시도(다른 kind)와 같은 start 창(기본 30초,
-codex 120초 등)을 나눠 쓴다 — 다른 kind의 첫 `agent start`도 창의 시작 시각 기준
-남은 시간만 `--timeout`으로 받으므로 프로브가 쓴 시간만큼 줄어든다. 창이 다 쓰여
-`agent start` 재시도가 끝나면 실패 줄은 프로브가 쓴 ms와 `agent_pane_busy` 횟수를
-구분해 밝힌다.
-
-`devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
-`herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로
-기동하고, 최대 30초 창 안에서 herdr가 그 pane을 agent로 검출할 때까지 `agent get`을
-0.25초 간격으로 재조회한다(`pane run` 직후의 `agent_not_found`는 "아직 검출 전"이다;
-실측 검출 0.42초). 검출 뒤 같은 창의 남은 시간 안에 idle을 기다리고,
-`agent explain --format json`이 `agent=devin`과
-`matched_rule.id=welcome_prompt_footer`를 함께 보고한 뒤에만 그 pane id를 agent 이름으로
-rename한다. 첫 explain이 어떤 규칙에도 매치되지 않고 평가된 화면 영역이 방금
-타이핑한 `devin …` 명령 줄뿐이면(m1b처럼 TUI가 아직 안 그려진 시작 중 상태)
-같은 창 안에서 백오프로 재조회한다. 명령 줄이 아닌 다른 내용이 보여도 매치된
-규칙이 없으면 마찬가지로 창이 닫힐 때까지 재조회한 뒤 실패한다; 매치된
-규칙(신뢰 다이얼로그·권한
-프롬프트·오류 화면)이나 다른 agent, 읽을 수 없는 envelope은 즉시 판정하고,
-창이 닫히면 기존 fail-closed 경로와 진단 아티팩트 보존이 그대로 적용된다.
-Devin에는 `--effort` 플래그가 없고 effort가 모델 id 안에 들어 있으므로,
-effort 런그는 별도 프로필이다(#635): `devin-swe2-medium`(`--model swe-2-medium`)과
-`devin-swe2-max`(`--model swe-2-max`)는 무료이고, `devin-ds41-max`
-(`--model deepseek-v4-1-flash-max`)는 유료다. `devin-swe2`는 high 기본값을 유지한다.
-quota gate는 `devin-swe2`와 `builder-devin`만 `devin-swe2`로 넘긴다. 그 외 devin 철자(`devin-swe2-medium`, `devin-swe2-max`, `devin-swe17`, `devin-glm52`, `devin-ds41`, `devin-ds41-max`)는 자기 이름으로 넘기고, `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`는 scopefuel grades.py의 런타임 프로필(`devin-swe2-medium`, `devin-swe2-max`, `devin-ds41`, `devin-ds41-max`)로 넘긴다. 유료 런그를 SWE-2 Free 버킷으로 판정하지 않기 위해서다. pool 결정·기록은 scopefuel 출력과 arbiter가 소유하고, launch_profile은 런처 철자 그대로다.
-
-이 분기는 herdr 0.9.1의 `agent start` 소유권 검사가 Devin 3000.11.1에서 실패하는 동안의
-임시 우회다. herdr가 고쳐지면 걷어낸다. 해제 조건은 운영자가 만든 disposable pane에서
-아래 명령이 Devin 3000.11.1을 대상으로 rc=0을 재현하는 것이다(`PANE_ID`는 그 pane id).
-
-```bash
-herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false
-```
-
-`builder-devin`(동일 argv)과 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`
-모두 `--role builder`로 쓸 수 있다. #666 부터 런그별 빌더 철자도 열려 있다 —
-`builder-devin-medium`·`builder-devin-max`(무료 swe-2 런그, 워커 변형과 동일 argv)와
-유료 ds41 런그의 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책)다.
-빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 scopefuel/pacelever 카탈로그의 `builder-devin` 행이다.
-#704(#594 E6 측정)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
-`builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·
-`builder-luna-max`·
-`builder-kimi-high`·`builder-kimi-max`를 추가한다 — 이름의 마지막 구간이 고정 런그이고,
-`SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식 없이는 스폰이 거부된다(게이트가 에스컬레이션으로
-표시한 런그도 명시 `--effort` 런그에는 `--operator-request` REF를 요구하지 않는다 — scopefuel
-#716). kimi 런그는 `bin/kimi-clone-home --effort high|max`의 클론 홈이
-런그를 고정한다. #737(decision 4088)은 같은 규칙으로 grok 런그
-`builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`와 sol 런그
-`builder-sol-medium`(`SCOPEFUEL_E6_ARM=codex-sol@medium`)을 추가한다 —
-각각 `SCOPEFUEL_E6_ARM=grok-hi@low|medium|xhigh` 표식이 필요하고, grok·sol-medium 런그는
-에스컬레이션이 아니므로 `--operator-request`는 불요다. 기존 `builder-grok`은 그대로
-무표식(게이트는 `grok-hi` 기본 런그 판정), `builder-sol-high`도 #704 그대로다.
-hk 1796은 같은 규칙으로 hk 1786 팔의 네 런그를 연다 — `builder-sonnet-medium`
-(`SCOPEFUEL_E6_ARM=sonnet@medium`), `builder-haiku-low`(`haiku@low`),
-`builder-luna-low`(`codex-luna@low`), `builder-luna-medium`(`codex-luna@medium`).
-hk 2043은 r1026luna down arm(L-A+ luna@high 대 sonnet@xhigh)을 위해
-`builder-luna-high`(`codex-luna@high`)를 같은 luna 계열에 더한다 — low/medium 과
-같은 E6 측정 철자이므로 `SCOPEFUEL_E6_ARM=codex-luna@high` 표식이 필요하고
-`codex-luna@high`로 기록된다.
-다섯 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁힌다.
-hk 2043은 r1026effdown arm B(haiku@high 대 haiku@medium)를 위해
-`builder-haiku-medium`(`haiku@medium`)을 haiku 계열에 더한다 — haiku-low 와 같은
-E6 측정 철자이므로 `SCOPEFUEL_E6_ARM=haiku@medium` 표식이 필요하고
-`haiku@medium`으로 기록된다.
-hk 1863은 같은 규칙으로 hk 1786 의 borrow-down·promote-up 팔 다섯 런그를 연다 — `builder-sol-low`(`SCOPEFUEL_E6_ARM=codex-sol@low`), `builder-haiku-high`(`haiku@high`), `builder-haiku-xhigh`(`haiku@xhigh`), `builder-haiku-max`(`haiku@max`), `builder-sonnet-low`(`sonnet@low`) — `builder-haiku-max`는 `builder-sol-max`·`builder-sonnet-max`와 같이 열려 있고(hk 1864), canon 에 `sonnet@low` 행이 아직 없어 실게이트의 `builder-sonnet-low`는 행이 푸시될 때까지 거부된다.
-2026-09-26 운영자 결정이 닫았던 max 런그 철자 중 `builder-sonnet-max`·
-`builder-luna-max`·`builder-kimi-max`는 hk 1864(2026-10-23
-운영자 결정, 빌더 좌석 no-max 규칙 폐지)로 열렸다 — 다른 E6 런그와 같이 정확한
-`SCOPEFUEL_E6_ARM` 표식이 필요하고 ultra 는 계속 거부한다.
-hk 2043(운영자 r1026solmax, revision 3)은 **정상 pinned 철자** `builder-sol-xhigh`(신규)와
-`builder-sol-max`를 연다. 둘은 런그 고정 규칙(카탈로그·게이트 상담, 모델, 기본 effort,
-다른 `--effort` 거부)은 E6 철자와 같지만 **`SCOPEFUEL_E6_ARM` 표식을 요구하지 않는다** —
-이미 배치된 canon 행이기 때문이다. `builder-sol-max`는 S+ gate=default 행(r1026solmax)이라
-게이트가 REF를 요구하지 않고, `builder-sol-xhigh`는 S+ escalation 행이라 게이트가 입장을
-계속 결정한다. 상담·기록은 각각 `codex-sol@max`·`codex-sol@xhigh`다. 상담 런그가 하나로
-고정된 비-pinned 철자(`builder-sol`·`builder-sol6`·`builder-grok` 등)는 그 외 `--effort`를
-거부하며, 거부 줄은 해당 런그의 pinned 철자를 지목한다(예: `--effort xhigh` →
-`builder-sol-xhigh`).
-#921(2026-09-29 운영자 보고, Sonnet 5.5 실험 E1/E2)은 비-런그 빌더 철자
-`builder-sonnet`을 연다 — `builder-opus`의 argv 모양(`--model sonnet`
-`--dangerously-skip-permissions`)을 쓰고 `--effort`는 high·xhigh·max만 받으며
-기본값은 xhigh다. quota pool은
-claude, launch_profile은 canonical `sonnet@<effort>`로 기록된다. E6 철자
-`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요).
-
-`devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
-프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도
-같은 argv에 모델명만 `deepseek-v4-1-flash-max`인 worker 전용 유료 변형이다. 넷 모두
-scopefuel의 `devin` 풀 하나를 공유하고 worker 전용이다 — 유료 ds41 런그의 빌더
-경로는 `builder-ds41`·`builder-ds41-max` 철자뿐이다. 급은 미측정 —
-`devin-glm52`·`devin-swe17`은 T1, `devin-ds41`·`devin-ds41-max`는 T1/T2로 시작하며
-reps 3건으로 확정한다. 이 넷 중 `devin-ds41`·`devin-ds41-max`만 유료다.
-
-hk 1380(2026-10-10 운영자 결정 — 09-14 유료 Devin 미사용 선을 이 두 철자에 대해
-대체)은 유료 fusion 철자 `devin-fusion-opus55`·`devin-fusion-sonnet55`를 추가한다 —
-같은 무인 argv에 모델명만 `fusion-claude-opus-5-5-high-sidekick-swe-2-medium`·
-`fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium`. worker/tester 전용이고
-quota pool은 `devin`이지만 게이트는 `devin-swe2`가 아니라 각자의 gate_policy
-항목으로 판정하며 family 는 Claude 계열(anthropic)이다 — **claude 빌더 산출물의
-tester 로는 못 쓴다**(동일 계열로 간주되고, 동일 계열 예외는 tester 급 S+ 부터라
-B 인 이 철자들에는 해당 없음). 미측정 B 로 T1/T2, hk 1382 의 tester/checker 시험 대상.
-`--role builder`는 두 철자를 거부한다(fusion 빌더 사용은 hk 1382 이후 결정).
-Fable·Astra fusion 철자는 없다.
-`devin-fusion-sol61`은 Devin launcher의 Fusion-Sol high 프로필이며 scopefuel codex pool과 openai family를 쓴다 — 현재 worker/tester 전용이고 `-fast` 철자는 지원하지 않는다.
-`devin-fusion-sol61-xhigh`은 Devin launcher의 Fusion-Sol xhigh 프로필이며 scopefuel codex pool과 openai family를 쓴다 — 현재 worker/tester 전용이고 `-fast` 철자는 지원하지 않는다.
-
-hk 1620(2026-10-18 운영자 결정 devin-argon-trial, phase 1 — operator-desk
-r1018b953go 승인)은 유료 Argon 시험 철자 `devin-argon`·`devin-argon-medium`·
-`devin-argon-low`를 추가한다 — 같은 무인 argv에 모델명만 `gemini-4-argon-high`·
-`gemini-4-argon-medium`·`gemini-4-argon-low`. worker/tester 전용이고 quota pool은
-`devin`(계정 Daily/Weekly — SWE-2 Free 모델스코프 버킷이 아니다)이며 게이트는
-각자의 gate_policy 항목으로 판정한다. family 는 Gemini 계열(google)이다.
-Phase 1은 스폰 배선뿐 — 급 미배치(grade 없음), 10-27 전까지 director-1이
-tester/checker rep 2건을 돌린다. `--role builder`는 세 철자를 거부한다.
-
-`--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
-`NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
-사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
-
-빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
-`captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
-경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
-argv, A+ 급 작업의 T1·T2 빌더 — 카탈로그 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
-#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737·hk 1796·hk 1863 의 E6 측정 런그 철자(`builder-opus-low` 등 25개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그는 hk 1864 로 열림)도 `--role builder`를 받는다.
-파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
-`owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
-이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
-R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
-
-`wrk done`, `wrk joined`, 그리고 보고서가 지정된 `wrk escalate`는 보고서를
-`reports/<job>/<basename>` 키로 handoffkeep CLI에 올린다. CLI는
-`HANDOFFKEEP_URL`/`HANDOFFKEEP_TOKEN` 또는 `~/.config/handoffkeep/config.env`에서 자격증명을
-읽으며, 업로드 실패는 경고만 남기고 완료 레코드는 계속 쓴다. 성공 시 마지막 줄의
-`doc:<key>` 접미를 웹 콘솔이 문서 링크로 연다.
-
-`wrk done|escalate|joined`는 설치된 panewire가 `panewire job probe`에 정확히
-`panewire-job/1`로 답할 때만 같은 인자를 `panewire job <명령>`에 넘긴다(#499). 그 경로는
-레코드·소켓 요청·업로드·출력을 wrk와 바이트 단위로 같게 남긴다(panewire
-`testdata/job_golden`). 바이너리가 없거나, `job`을 모르는 구 panewire이거나, 답이 다르거나,
-probe가 5초 안에 끝나지 않으면 지금까지의 wrk 경로를 그대로 쓴다. 넘긴 뒤에는 wrk가 아무것도
-더 하지 않으므로(`exec`) 한 이벤트는 두 경로 중 한 곳에서만 쓰인다. `WRK_JOB_DELEGATE=0`은
-wrk 경로를 강제한다(golden 재생성·롤백용).
-
-## 완료 센티널 판정표
-
-`wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
-`herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
-`completion-sentinel.log`에 한 줄씩 남긴다
-(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason|recovered:reason>`).
-action 이 `recovered:` 가 아닌 회복 폴(pending, completed)은 줄 끝에 `recovered=<reason>` 이 붙는다.
-창이 에이전트가 살아 있는 폴에서 만료되면 `action=watch-expired elapsed=<n>s` 한 줄을 남기고 센티널만 끝난다.
-
-| 관측 | 분류 | 판정 |
-|---|---|---|
-| `agent_not_found` 등 pane/terminal 부재 에러 코드 | 확정 소멸 | 즉시 `job.lost` (`reason=agent_not_found`) |
-| 빈 출력 · 비정상 종료 · JSON 파싱 실패 · 소켓 에러 | 일시 장애 | `WRK_COMPLETION_INTERVAL_S`(기본 30s) 간격 재시도. **연속** `WRK_SENTINEL_TRANSIENT_MAX`(기본 10회 ≈5분) 초과 시에만 `job.lost` (`reason=herdr_unreachable`) |
-| 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` — 단 report의 관측 키가 한 interval 동안 그대로일 때만(첫 관측은 `action=pending`). 부분 작성 중인 파일로 먼저 나가지 않기 위함이다 |
-| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 부재·불명 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
-| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 존재(class=ok) | 감시 창 만료 | `action=watch-expired` 로그 후 센티널만 종료. `job.lost`·종료 기록·쿼타 해제 없음, 잡은 `wrk done`·`joined`·`reap`·`prune` 이 평소대로 끝낸다 |
-| `WRK_COMPLETION_TIMEOUT_S` 경과 뒤 report 첫 관측(에이전트 `idle`/`done`) | 늦은 첫 관측 | `action=pending late=1` 한 번 — 같은 관측 키가 다음 폴까지 유지되면 평소대로 `job.completed`+쿼타 해제, 아니면 그 폴에서 `watch-expired` |
-
-`job.completed` 레코드는 report 본문의 sha256(`report_sha256` 필드)으로 라운드를
-식별한다. 같은 내용의 report에 대한 완료 기록이 이미 있으면 `wrk done`·센티널 어느
-쪽이든 두 번째 레코드와 통지를 억제하고 `completion-suppressed.log`에 한 줄 남긴다
-— 억제는 건수가 아니라 "이 report artifact의 완료가 이미 기록됐는가"의 멤버십 판정이다.
-내용이 바뀐 report는 새 라운드로 별개 레코드가 된다.
-
-같은 경로로 갱신된 후속 라운드는 panewire emit의 outbox 키
-`(kind, job, epoch, report_path, reason)`가 이전 레코드와 충돌해 rc 6으로 거부되므로,
-`wrk done`·센티널은 바뀐 내용을 같은 디렉터리의 `<stem>-r<N>.md`
-(N = 이 잡의 기록된 완료 라운드 수 + 1)로 스냅샷하고 레코드·handoffkeep 문서
-업로드·emit·OK 줄 모두 그 새 경로를 쓴다 — 원본 report 파일은 건드리지 않는다.
-이미 새 경로를 가리키는 `--report`(예: `report-r2.md`)는 있는 그대로 relay되고,
-`panewire emit`이 비0으로 끝나면 경고 한 줄에 job·report 경로·rc를 밝히고 OK 줄에
-`relay=file-only`를 붙인다(레코드·종료 처리·exit status는 그대로다).
-이 자동 스냅샷은 이 변경을 포함한 agent-skills가 설치된 곳에서만 적용된다
-— 그때까지는 후속 라운드 report를 `report-r<N>.md`로 쓰고 그 경로를
-`wrk done`에 넘겨라(명시한 새 경로는 있는 그대로 relay된다).
-
-**빈 값은 소멸의 증거가 아니다.** 2026-09-04 소켓 일시 정지와 비기본 herdr 세션
-때문에 그날 스폰한 거의 모든 잡이 스폰 30초 뒤 `job.lost`로 찍혔고, 센티널이 죽어
-워커가 정상 완료해도 `job.completed`를 아무도 쓰지 못했다(수동 전달 3회).
-
-`job.lost`를 쓴 뒤에도 센티널은 즉시 끝나지 않는다. `WRK_SENTINEL_LOST_GRACE`
-(기본 1800초) 동안 계속 감시해 그 사이 report가 생기고 상태가 `done`/`idle`이 되면
-`job.completed`를 **추가로** 쓰고 종료한다(panewire가 completed를 relay한다).
-
-유예는 **연속 부재**만 센다. lost 상태에서 나중 폴이 에이전트를 다시 보면 `lost`를
-지우고 `job.recovered` 한 건을 남긴다(`reason`은 직전 lost 사유, `lost_duration_s`는
-그 에피소드의 초). `agent_not_found`는 `herdr_agent_probe`가 class=ok(agent_status가
-있는 응답)일 때만 풀린다. pane만 있고 상태가 없는 응답은 회복이 아니다.
-`herdr_unreachable`은 herdr가 다시 답하면(class가 transient가 아니면) 풀리고, 그 답이
-gone이면 같은 폴에서 `agent_not_found` 에피소드를 새로 연다. `timeout`은 감시 창이라
-class=ok로 풀리지 않는다. 창이 이미 지난 회복 폴은 부재 에피소드의 `job.recovered`를
-쓴 뒤 `watch-expired` 로 센티널만 끝낸다(에이전트가 보이므로 `job.lost` 없음).
-gone과 ok가 한 폴씩 번갈아 와도 창을 뒤로 미루지 못한다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
-폴은 이벤트를 더 쓰지 않는다. `job.recovered`는 terminal도 revive도 아니다.
-
-분리된 센티널은 터미널에서 유도되는 herdr 세션 컨텍스트를 잃는다. 그래서 wrk는
-스폰 시점의 `HERDR_SESSION`·`HERDR_SOCKET_PATH`·`HERDR_BIN(_PATH)`를 센티널 환경에
-명시적으로 박아 넣는다. 서버가 비기본 세션에 사는 호스트에서는
-`WRK_SENTINEL_HERDR_SESSION`/`WRK_SENTINEL_HERDR_SOCKET`로 스폰 측이 직접 지정한다.
-
-```bash
-WRK_SENTINEL_HERDR_SESSION=worker wrk spawn -c ... -m ... --job <id>
-```
-
-## `wrk reap` — 끝난 pane 회수
-
-워커·tester가 끝나도 pane은 herdr에 남아 하루 40~60개가 쌓이고, 그만큼 herdr 서버
-부하(fd·구독)가 된다. `wrk reap`은 인박스를 읽어 **끝난 것이 증명된** 잡의 탭만 닫는다.
-
-```bash
-wrk reap --lane REAP_LANE              # dry-run: 닫을 목록만 출력
-wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
-wrk reap --lane REAP_LANE --job JOB --apply  # 지정한 job만 실제 회수
-```
-
-`--job`은 반복하거나 쉼표로 여러 id를 지정할 수 있으며, id 전체가 정확히 일치하는 잡만
-고려한다. 지정되지 않은 잡은 회수 후보와 skip 출력에서 모두 제외된다. `--apply`에서도
-현재 후보를 다시 확인하며, 지정한 잡이 더 이상 후보가 아니면 `reason=not-candidate`를
-출력하고 닫지 않는다. `--apply`에는 계속 `--lane`이 필요하다.
-
-회수 조건(**전부** 충족해야 후보):
-
-- terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있다
-- 가장 늦은 terminal 이벤트 **뒤에** `job.claim`·`job.reclaim`·`job.spawned`(·`job.reprompted`)가
-  없다 — 끝난 뒤 다시 잡힌 잡은 살아 있는 작업이다(`skip … reason=reclaimed-after-terminal`).
-  `job.lost`·`job.recovered`·`quota_pool.*`는 되살림이 아니다
-- 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
-- **가장 늦은** `job.spawned` 영수증의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다.
-  pane·tab은 그 영수증 하나에서 **한 벌로** 읽는다(앞선 영수증의 tab과 섞지 않고, 깨진 최신
-  영수증은 `malformed-record`로 건너뛴다)
-- herdr가 말하는 그 pane의 탭이 기록된 탭과 같다(다르면 `skip … reason=tab-mismatch`)
-- close **직전에 다시 읽은** `herdr tab list`가 그 탭의 `pane_count`를 **정확히 1로 확인**한다. 조회 실패·JSON 파손·목록에 없음·
-  `pane_count` 부재/비정수(bool 포함)·중복 항목은 "공유일 수 있음"으로 보고 닫지 않는다
-  (`skip … reason=tab-count-unknown`, fail-closed). 2 이상은 기존대로 `tab-shared`
-- 아직 회수된 적이 없다(`job.reaped` 이벤트 없음)
-
-`--apply`는 `--lane` 없이 거부된다(nonzero, 아무것도 조회·종료하지 않음). 전역 회수 우회
-플래그는 없다 — 레인마다 따로 돌린다. dry-run은 lane 없이도 된다.
-
-`working`/`blocked` pane, terminal 이벤트 없는 잡, herdr가 해석하지 못하는 pane은
-건드리지 않는다(해석 실패는 소켓 문제일 수 있고, 확인 못한 탭을 닫는 편이 더 나쁘다).
-빌더 pane(claim `role: builder` 또는 legacy `captain`)은 `--include-builders` 없이는 제외한다.
-`--include-captains`는 같은 동작의 legacy 별칭이다. 기본은 **dry-run**이며, `--apply`로 닫은 잡에만 평면 `job.reaped` 이벤트(`pane_id`·`tab_id`·`at`)를
-남긴다. `wrk spawn`은 이를 위해 `job.spawned` payload에 `tab_id`를 함께 기록한다
-(기존 필드는 그대로 — 구형 herdr로 만들어져 `tab_id`가 없는 잡은 `agent get`으로 해석한다).
-
 ## 도메인 경계 (ROB-1199 — 위반 금지)
 
 ```text
 scopefuel   쿼타·급·정책     "얼마 남았나"    ← arbiter 가 읽는 입력원
-wrk         세션 수명주기    "어떻게 띄우나"
+(호출자)    세션 수명주기    "어떻게 띄우나"  (runtug)
 arbiter     작업 조정        "누가 점유했나"
 ```
 
-호출 방향은 `wrk → arbiter → scopefuel --json` 한 방향이다. `wrk spawn`은 `scopefuel gate`
-통과 직후 arbiter로 job을 claim하고 quota pool 실행 기록을 남긴다 — **pool 매핑은 wrk에 없다.**
+호출 방향은 `호출자 → arbiter → scopefuel --json` 한 방향이다. 호출자는 `scopefuel gate`
+통과 직후 arbiter로 job을 claim하고 quota pool 실행 기록을 남긴다 — **pool 매핑은 호출자에 없다.**
 arbiter가 scopefuel이 내놓은 gate 출력에서 pool을 읽고 `scopefuel --json`의 provider 목록과
-대조한다. 배타 lease 획득 실패는 스폰 거부(exit 3)이고, quota_pool 기록의 claim·준비·기록
-실패는 경고 후 진행한다. 스폰 실패 시 성공한 quota_pool 기록은 반납한다. `arbiter gc`는
+대조한다. `arbiter gc`는
 설치된 `herdr agent list`를 기본으로 읽어 exact claim-event identity와 대조한다. `working`이
 아닌 `idle`·`blocked`·`done` 기록은 감사 이벤트와 함께 정리하지만, `unknown` 또는 매핑 없는
 구형 기록은 추측하지 않고 GC를 거부한다. 테스트에서는 JSON 경로를 넘길 수 있다. 우회

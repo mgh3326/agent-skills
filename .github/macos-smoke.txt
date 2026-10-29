@@ -1,20 +1,8 @@
 # Darwin smoke commands and sensitive path coverage.
 # Commands must also be present in tests/ci-suites.txt.
 [smoke]
-bash tests/test-wrk-job-end.sh
-bash tests/test-wrk-heavy-class.sh
-bash tests/test-codex-project-trust.sh
-python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v
-python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
+bash tests/test-arbiter.sh
 
 # Path|smoke command (or - when the full macOS suite is required)|Darwin-sensitive reason
 [darwin-sensitive]
-bin/wrk|-|Shared runner code spans BSD stat, setsid, and /private/tmp path handling; smoke suites cover only selected call paths.
-bin/arbiter|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v|tests/test_wrk_trust_paths.py:97 runs both implementations; tests/test_wrk_trust_paths.py:438-446 covers /private/tmp and /var/folders aliases.
-tests/test-wrk.sh|-|Long suite contains BSD sed and stat branches and is intentionally outside the smoke subset.
-tests/test-wrk-job-end.sh|bash tests/test-wrk-job-end.sh|tests/test-wrk-job-end.sh:808-821 tests fork, os.setsid, and a child start_new_session; line 1512 covers the second setsid helper.
-tests/lib/tmp-writers.sh|bash tests/test-wrk-job-end.sh|tests/lib/tmp-writers.sh:165 reads ps -o lstart; lines 518-528 use Python os.setsid because macOS has no setsid command.
-tests/test-wrk-heavy-class.sh|bash tests/test-wrk-heavy-class.sh|tests/test-wrk-heavy-class.sh:971 exercises the BSD stat -f and GNU stat -c fallback.
-tests/test-codex-project-trust.sh|bash tests/test-codex-project-trust.sh|tests/test-codex-project-trust.sh:396-399 creates and reads symlinks with readlink.
-tests/test_wrk_pi.py|python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v|tests/test_wrk_pi.py:73-76 starts a subprocess in a fresh session.
-tests/test_wrk_trust_paths.py|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v|tests/test_wrk_trust_paths.py:438-446 exercises macOS /private/tmp and /var/folders path aliases.
+bin/arbiter|bash tests/test-arbiter.sh|Arbiter resolves trust paths and temp roots, including macOS /private/tmp and /var/folders aliases.

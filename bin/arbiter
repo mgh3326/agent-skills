@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """arbiter — 작업 조정(admission control) 도구.
 
-도메인 경계(운영자 결정, ROB-1199): `wrk → arbiter → scopefuel --json`.
+도메인 경계(운영자 결정, ROB-1199): `호출자 → arbiter → scopefuel --json` (호출자였던 wrk 는 퇴역, runtug 로 대체).
 - scopefuel : 쿼타·급·정책 ("얼마 남았나")  — arbiter 가 읽는 입력원. 역방향 의존 금지.
-- wrk       : 세션 수명주기 ("어떻게 띄우나") — arbiter 를 호출하는 쪽.
+- 호출자    : 세션 수명주기 ("어떻게 띄우나") — arbiter 를 호출하는 쪽.
 - arbiter   : 작업 조정 ("누가 점유했나")   — 이 파일.
 
 저장소는 `$XDG_DATA_HOME/arbiter/state.db` 로 scopefuel 의 bench.db 와 완전히 분리한다.
 
 claim 은 신뢰 경로 명령이다(hk 1894): ARBITER_INBOX_ROOT·XDG_DATA_HOME·HOME 이 passwd 홈 기준 정본 경로와
-다르면 거부(exit 2)하고, WRK_TEST_MODE=1(테스트 전용)에서는 임시 루트 아래 재정의만 허용한다. wrk 의 신뢰 경로와
-같은 규칙이다(아래 trust paths 블록은 bin/wrk 와 바이트 단위로 같다).
+다르면 거부(exit 2)하고, WRK_TEST_MODE=1(테스트 전용)에서는 임시 루트 아래 재정의만 허용한다.
 
 fail-closed 가 핵심 요구사항이다. 배타 lease 획득 실패·quota_pool 기록 실패·DB 접근 실패·
 스키마 불일치는 전부 비-0 exit 이며, "일단 통과"하는 경로는 존재하지 않는다(우회 플래그도
-만들지 않는다). quota_pool 기록 실패를 경고 후 진행할지는 호출자인 wrk의 설치/수명주기
+만들지 않는다). quota_pool 기록 실패를 경고 후 진행할지는 호출자의 설치/수명주기
 정책이다.
-도구 자체가 설치되지 않은 과도기만 호출자(`wrk`)가 경고 후 진행한다.
+도구 자체가 설치되지 않은 과도기만 호출자가 경고 후 진행한다.
 
 exit code
   0  성공
@@ -63,8 +62,7 @@ BUSY_TIMEOUT_MS = 10000
 ORPHAN_STARTUP_GRACE = dt.timedelta(minutes=10)
 
 # hk 1894: commands whose paths must be canonical (or, in test mode, under a temp
-# root). wrk's trust path calls no arbiter command today; hk 1453 half 2 adds
-# job-get here. _TRUSTED is set by enforce_trust() and read by db_path() and
+# root). hk 1453 half 2 adds job-get here. _TRUSTED is set by enforce_trust() and read by db_path() and
 # inbox_root().
 TRUST_COMMANDS = frozenset(("claim",))
 _TRUSTED: dict | None = None
@@ -112,7 +110,7 @@ def inbox_root() -> Path:
 
 # ---------------------------------------------------------------- trust paths
 
-# --- trust paths: begin (byte-identical in bin/wrk and bin/arbiter; tests/test_wrk_trust_paths.py compares them) ---
+# --- trust paths: begin ---
 # hk 1894: where one trust-bearing operation may read its events inbox and its
 # grant evidence. Needs os, shutil and stat from the host module. The canonical
 # home is an argument (the passwd home of the uid, never HOME), so the unit tests

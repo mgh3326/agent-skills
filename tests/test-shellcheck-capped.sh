@@ -156,16 +156,16 @@ assert_ci_args() {
 for code in 0 1; do
   rm -f "$ARGS_FILE"
   assert_exit "$code" env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT="$code" \
-    "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh
-  assert_ci_args tests/test-wrk.sh
+    "$ROOT/scripts/shellcheck-capped" tests/test-ci-suites.sh
+  assert_ci_args tests/test-ci-suites.sh
   printf 'PASS T1-shellcheck-exit-%s-and-CI-flags\n' "$code"
 done
 
 rm -f "$ARGS_FILE" "$TMP/systemd-args" "$TMP/systemd-calls"
 assert_exit 0 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 \
   SYSTEMD_STUB_MODE=success SYSTEMD_ARGS_FILE="$TMP/systemd-args" SYSTEMD_CALLS_FILE="$TMP/systemd-calls" \
-  "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh
-assert_ci_args tests/test-wrk.sh
+  "$ROOT/scripts/shellcheck-capped" tests/test-ci-suites.sh
+assert_ci_args tests/test-ci-suites.sh
 grep -Fxq 'MemoryMax=2048M' "$TMP/systemd-args" || { echo 'FAIL T1: cgroup MemoryMax was not applied' >&2; exit 1; }
 grep -Fxq 'MemorySwapMax=0' "$TMP/systemd-args" || { echo 'FAIL T1: cgroup swap cap was not applied' >&2; exit 1; }
 printf '%s\n' probe scope >"$TMP/expected-systemd-calls"
@@ -178,10 +178,10 @@ err="$TMP/cgroup-oom.stderr"
 rc=0
 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SYSTEMD_STUB_MODE=oom \
   SYSTEMD_RESULT=oom-kill SYSTEMD_ARGS_FILE="$TMP/systemd-args" SYSTEMD_CALLS_FILE="$TMP/systemd-calls" \
-  "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh >"$out" 2>"$err" || rc=$?
+  "$ROOT/scripts/shellcheck-capped" tests/test-ci-suites.sh >"$out" 2>"$err" || rc=$?
 [[ "$rc" == 86 ]] || { printf 'FAIL T2: cgroup OOM should map to 86, got %s\n' "$rc" >&2; exit 1; }
 [[ "$(wc -l <"$err" | tr -d '[:space:]')" == 1 ]] || { echo 'FAIL T2: cgroup cap should emit one stderr line' >&2; exit 1; }
-grep -Fxq 'shellcheck-capped: shellcheck exceeded 2048 MB on tests/test-wrk.sh; run it in CI or use --changed BASE' "$err" || {
+grep -Fxq 'shellcheck-capped: shellcheck exceeded 2048 MB on tests/test-ci-suites.sh; run it in CI or use --changed BASE' "$err" || {
   echo 'FAIL T2: cgroup cap diagnostic missing' >&2
   exit 1
 }
@@ -194,9 +194,9 @@ err="$TMP/cap.stderr"
 rc=0
 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_RSS_KB=524289 \
   BYSTANDER_PID_FILE="$BYSTANDER_PID_FILE" SHELLCHECK_PID_FILE="$SHELLCHECK_PID_FILE" \
-  "$ROOT/scripts/shellcheck-capped" --cap-mb 512 tests/test-wrk.sh >"$out" 2>"$err" || rc=$?
+  "$ROOT/scripts/shellcheck-capped" --cap-mb 512 tests/test-ci-suites.sh >"$out" 2>"$err" || rc=$?
 [[ "$rc" == 86 ]] || { printf 'FAIL T2: expected exit 86, got %s\n' "$rc" >&2; exit 1; }
-grep -Fxq 'shellcheck-capped: shellcheck exceeded 512 MB on tests/test-wrk.sh; run it in CI or use --changed BASE' "$err" || {
+grep -Fxq 'shellcheck-capped: shellcheck exceeded 512 MB on tests/test-ci-suites.sh; run it in CI or use --changed BASE' "$err" || {
   echo 'FAIL T2: expected the cap diagnostic' >&2
   exit 1
 }
@@ -209,7 +209,7 @@ echo 'PASS T2-watchdog-stops-only-shellcheck'
 
 for bad in 100 99999 abc; do
   rm -f "$ARGS_FILE"
-  assert_exit 2 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 "$ROOT/scripts/shellcheck-capped" --cap-mb "$bad" tests/test-wrk.sh
+  assert_exit 2 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 "$ROOT/scripts/shellcheck-capped" --cap-mb "$bad" tests/test-ci-suites.sh
   [[ ! -e "$ARGS_FILE" ]] || { echo "FAIL T3: shellcheck ran for invalid cap $bad" >&2; exit 1; }
   printf 'PASS T3-reject-cap-%s\n' "$bad"
 done
@@ -393,8 +393,8 @@ diff -u "$TMP/expected-synthetic-args" "$ARGS_FILE"
 echo 'PASS T5-synthetic-CI-flags-forwarded'
 
 rm -f "$ARGS_FILE"
-assert_exit 0 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh
-assert_ci_args tests/test-wrk.sh
+assert_exit 0 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 "$ROOT/scripts/shellcheck-capped" tests/test-ci-suites.sh
+assert_ci_args tests/test-ci-suites.sh
 echo 'PASS T5-wrapper-flags-match-parsed-CI-step'
 
 echo 'PASS test-shellcheck-capped (14 assertions)'
