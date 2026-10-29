@@ -2,6 +2,6 @@
   "comment": "Kept only for local_sources: the ci.yml docs-only classifier and wake/SKILL.md read these sha256 pins (tests/test-ci-suites.sh checks them). The wrk-dependent tester/merge gate that used the rest of this file was retired with wrk.",
   "local_sources": {
     ".github/workflows/ci.yml": "d0b50cfcbd55691a5509038bbb12ba123d8594630a6264b22011ab2cafab1d10",
-    "bin/arbiter": "0647620006d6c62dc3de0774c36c4f831f4799676461fd19a7c6f0e5969bff1c"
+    "bin/arbiter": "9db56b78c81062c3d958e68cb1d2b14ad85d60bc477f8c43ddeeeb6c0339be86"
   }
 }
