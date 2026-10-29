@@ -12,8 +12,8 @@ panewire `go test ./...` 등). 반드시 `runtug heavy -- <cmd>` 로 감싼다:
 - 보유자·유효 상한·load_wait 상태는 `runtug heavy status` 로 본다(status 는 슬롯 파일을 만들지 않는다).
 
 호스트별 상한은 **그 머신 자신의** hosts.toml `[local] heavy_max` 가 정한다(없으면 1, `0` 이면 rc 78
-전면 거부). 호스트별 확정값의 정본은 각 머신의 hosts.toml 이다(hk task 772·#1241). `heavy_max = 0`
-인 호스트에서는 1–3개 targeted test 파일을 직접 돌리는 것만 허용되고, 그 이상은 heavy 가 허용된
+전면 거부). 호출별 `WRK_HEAVY_MAX` 는 그 호출의 상한만 덮어쓴다 — 브리프에서 쓰지 않는다.
+호스트별 확정값의 정본은 각 머신의 hosts.toml 이다(hk task 772·#1241). `heavy_max = 0` 인 호스트에서는 1–3개 targeted test 파일을 직접 돌리는 것만 허용되고, 그 이상은 heavy 가 허용된
 호스트로 보낸다. 획득·거부·대기 초과는 `~/.local/state/wrk/heavy.log`(JSONL, `WRK_HEAVY_LOG`)에
 남는다. runtug 는 기존 호스트 락 namespace 를 그대로 쓰므로 옛 launcher 의 실행과도 서로 배제한다.
 

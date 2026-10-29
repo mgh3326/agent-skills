@@ -12,7 +12,10 @@ worktree 와 branch 를 지운다. **repo 세션은 머지 후 pane 을 손으�
   checkout commit 이 PR head SHA, origin 이 그 repo 여야 한다. 그래서 워커는 PR worktree 를 `-c` 로,
   잡 id 를 라벨로 스폰한다(`spawn.md` §4).
 - 닫기 전에 pane 이 `idle`·`done` 이어야 하고 `<jobs>/<pane 이름>` 이 있어야 한다(없으면
-  `not-a-job`). close 직전에 다시 읽어 바뀐 pane 은 건너뛴다.
+  `not-a-job`). close 직전에 다시 읽어 바뀐 pane 은 건너뛴다. working 인 pane 은 그 회차에
+  남고, 데몬이 `scan_after`(기본 720h) 안의 머지를 매 회차 다시 본다.
+- 🔴 mergewake 가 닫지 않는 pane(`not-a-job`·보호 이름·linked worktree 밖)은 §6-1 대로 스폰한
+  쪽이 거둔다.
 - 보호: pane 이름 `*-integrator`·`director-*`·`fleet-tooling-*`·`consult-*`·`cmd`, 이름 없는 pane,
   linked worktree 밖 pane. worktree 는 깨끗하고 regenerable 밖 gitignored 파일이 없을 때만 지운다.
 - 무엇을 닫을지 보려면 `mergewake reap --repo <owner>/<repo> --pr <n> --dry-run`. acting 은 데몬
@@ -35,8 +38,8 @@ herdr pane close <pane_id>                 # 회수
 ### 6-2. 회수 조건 — 셋 다 만족할 때만
 
 1. **job 이 terminal** — 머지·close·escalation **완료**. 이건 네 판단이다.
-2. **산출물이 파일로 확보** — `jobs/<job_id>/` 에 최종 보고가 있다. 화면에만 있으면 닫는
-   순간 증거가 소실된다.
+2. **산출물이 파일로 확보** — `jobs/<job_id>/`(상속 스폰이면 부모 잡 디렉터리일 수 있다)에 최종
+   보고가 있다. 화면에만 있으면 닫는 순간 증거가 소실된다.
 3. **pane 이 비-working**.
 
 ### 6-3. 🔴 비-working 은 회수 사유가 아니다

@@ -128,7 +128,9 @@ to a spawned worker; **T2 and above always**.
 6. **Landing check.** Confirm the brief was received (`ops` spawn §4-2), then stay idle until
    the worker's READY/ESC arrives. No polling loops.
 7. **On READY**, verify the push yourself — `git ls-remote origin wk/<slug>` must show the
-   reported head — record `H=$(gh pr view <n> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)`
+   reported head — and that the report is at its path outside the worktree (if not, copy it
+   from the live pane now: the pane is closed after merge). Record
+   `H=$(gh pr view <n> --repo <owner>/<repo> --json headRefOid --jq .headRefOid)`
    and run the merge gate against it. Pass → step 8. Checks still pending → wait
    (`gh pr checks <n> --repo <owner>/<repo> --watch`) and rerun the gate; that is not BLOCKED.
    Fail → §BLOCKED.
@@ -140,9 +142,11 @@ to a spawned worker; **T2 and above always**.
    A refused merge (head moved, conflict) means rerun the gate on the new head; do not clean
    up. Only after `MERGED`: check the report exists at its path outside the worktree
    (harvest it from the pane first if not — a closed pane loses it); once it exists, close
-   the hk task. The mergewake daemon closes the worker pane at once (its last screen goes to
-   the job dir) and removes the worktree and branch after `worktree_after` — do not close or
-   remove them by hand (`ops` reap). Deploys go to operator-desk.
+   the hk task. The mergewake daemon closes the worker pane once it is `idle`/`done` and its
+   job dir exists (last screen to `~/work/herdr-inbox/jobs/<job>/pane-screen.txt`), and removes
+   the worktree and branch after `worktree_after` — do not close or remove them by hand.
+   `mergewake reap --repo <owner>/<repo> --pr <n> --dry-run` shows what it will do; a pane it
+   keeps as `not-a-job` or protected is yours to reap (`ops` reap). Deploys go to operator-desk.
 
 ## Merge gate
 
