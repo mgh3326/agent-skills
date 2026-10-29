@@ -159,10 +159,18 @@ spawn_try -- --role tester --parent-job parent --job child --report "$INBOX/pare
 expect_rc 0 "parent-job tester with parent report"
 python3 - "$INBOX/child/completion-sentinel.pid" "$INBOX/parent/verdict.md" <<'LOCAL_PATH'
 from pathlib import Path
-import shlex, subprocess, sys
+import shlex, subprocess, sys, time
 pid = Path(sys.argv[1]).read_text().split()[0]
-command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
-args = shlex.split(command)
+# The pidfile holds $! of the backgrounded nohup launcher; until that forked
+# subshell execs, ps still shows the spawning wrk's argv. Wait (bounded) for
+# the exec instead of racing it.
+for _ in range(100):
+    command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
+    args = shlex.split(command)
+    if "sentinel" in args:
+        break
+    time.sleep(0.1)
+assert "sentinel" in args, "sentinel never exec'd for pid " + pid + ": " + command
 # wrk resolves the inbox; macOS /var and /tmp are aliases of /private paths.
 assert args[args.index("sentinel") + 5] == str(Path(sys.argv[2]).resolve()), "local sentinel report path: " + command
 LOCAL_PATH
