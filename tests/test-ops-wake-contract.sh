@@ -105,7 +105,7 @@ REQUIRED = [
     ("wake", "## Rules", "b953-real-home", r"Isolated HOME/XDG is for test and probe runs only"),
     ("wake", "## Merge gate", "b953-no-ci-replay", r"never replay CI on a host as a substitute"),
     ("wake", "## Merge gate", "b953-pin-rehash", r"A change to a hash-pinned file re-hashes its pin in the same PR"),
-    ("ops", "## Invariants (all references)", "b953-sentinel-stop", r"stops its completion sentinels before removing its temp root"),
+    ("ops", "## Invariants (all references)", "b953-sentinel-stop", r"stops its completion watchers before removing its temp root"),
     # Brief rules that moved in.
     ("wake", "## Brief rules", "one-to-one", r"\*\*Every instruction maps 1:1 to an observable acceptance check\*\*"),
     ("wake", "## Brief rules", "guard-placement", r"\*\*Placing a guard is part of the instruction:\*\* say what it checks, where it goes .{0,80}what it must not precede"),
