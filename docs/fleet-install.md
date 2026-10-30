@@ -18,13 +18,15 @@ What it does, in order:
    1800s; a fresh tag may not have a run row yet, so an empty list keeps
    polling). A non-success conclusion is an error.
 2. `gh release download <tag> -R mgh3326/<tool> --clobber` into a temp dir.
-3. `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c`). Required, never skipped.
+3. `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c`). Required, never skipped —
+   and every artifact about to be installed must be listed in it.
 4. Detects this host's `<os>-<arch>` (`uname`, x86_64→amd64, aarch64→arm64) and
    `install -m 755 <tool>-<os>-<arch> ~/.local/bin/<tool>`, then prints
    `<tool> --version`.
 5. Per `--hosts` entry: probes `<os>-<arch>` over ssh, `scp` the matching
-   binary to `.local/bin/<tool>.new`, then `chmod 755` + `mv -f` into place
-   (atomic replace) and prints `<tool> --version`.
+   binary to `.local/bin/<tool>.new`, runs `<tool>.new --version` to validate
+   it, then `mv -f` into place (atomic replace). If the staged binary cannot
+   run, the previous install stays untouched.
 6. Runs the configured restart hooks for every target that installed.
 
 Exit codes: `0` all targets ok · `1` at least one target (host or local)

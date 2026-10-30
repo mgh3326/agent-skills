@@ -65,11 +65,16 @@ case "${1:-}" in
     : >"$dest/SHA256SUMS"
     while read -r name; do
       [[ -n "${name:-}" && "$name" != \#* ]] || continue
-      printf '#!/bin/sh\necho "%s %s (%s)"\n' "$tool" "$tag" "$name" >"$dest/$name"
+      if [[ "${FLEET_INSTALL_FAKE_BROKEN:-}" == "$name" ]]; then
+        printf '#!/bin/sh\nexit 1\n' >"$dest/$name"
+      else
+        printf '#!/bin/sh\necho "%s %s (%s)"\n' "$tool" "$tag" "$name" >"$dest/$name"
+      fi
       chmod 755 "$dest/$name"
     done <"$manifest"
     while read -r name; do
       [[ -n "${name:-}" && "$name" != \#* ]] || continue
+      [[ "$name" == "${FLEET_INSTALL_FAKE_OMIT:-}" ]] && continue
       sum="$(sha_file "$dest/$name")"
       if [[ "${FLEET_INSTALL_FAKE_BADSHA:-}" == 1 ]]; then
         sum="0${sum#?}"

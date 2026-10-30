@@ -35,7 +35,8 @@ reset_env() {
   rm -rf "$FLEET_INSTALL_FAKE_DIR" "$FLEET_INSTALL_FAKE_ROOT" "$FLEET_INSTALL_BIN_DIR"
   mkdir -p "$FLEET_INSTALL_FAKE_DIR" "$FLEET_INSTALL_FAKE_ROOT"
   : >"$FLEET_INSTALL_SSH_LOG"; : >"$FLEET_INSTALL_SCP_LOG"; : >"$FLEET_INSTALL_GH_LOG"
-  unset FLEET_INSTALL_FAKE_DEAD FLEET_INSTALL_FAKE_BADSHA 2>/dev/null || true
+  unset FLEET_INSTALL_FAKE_DEAD FLEET_INSTALL_FAKE_BADSHA \
+    FLEET_INSTALL_FAKE_OMIT FLEET_INSTALL_FAKE_BROKEN 2>/dev/null || true
   : >"$FLEET_INSTALL_CONFIG"
 }
 
@@ -164,5 +165,41 @@ set -e
 printf '%s' "$out" | grep -q "no artifact for arch linux-arm64" \
   || fail "missing no-artifact message"
 pass "missing artifact marks host failed"
+
+# ── 7. artifact missing from SHA256SUMS -> refused ───────────────────────
+reset_env
+mk_release runtug v9 "$LA" linux-arm64
+mk_host a linux-arm64
+export FLEET_INSTALL_FAKE_OMIT=runtug-linux-arm64
+set +e
+out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+rc=$?
+set -e
+unset FLEET_INSTALL_FAKE_OMIT
+[[ $rc -eq 1 ]] || fail "unlisted artifact should exit 1, got $rc"
+printf '%s' "$out" | grep -q "not listed in SHA256SUMS" \
+  || fail "missing not-listed message"
+[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] \
+  || fail "installed an artifact absent from SHA256SUMS"
+pass "artifact absent from SHA256SUMS refused"
+
+# ── 8. staged .new fails --version -> old binary kept ────────────────────
+reset_env
+mk_release runtug v9 "$LA" linux-arm64
+mk_host a linux-arm64
+printf '#!/bin/sh\necho "runtug v8 (runtug-linux-arm64)"\n' \
+  >"$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug"
+chmod 755 "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug"
+export FLEET_INSTALL_FAKE_BROKEN=runtug-linux-arm64
+set +e
+out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+rc=$?
+set -e
+unset FLEET_INSTALL_FAKE_BROKEN
+[[ $rc -eq 1 ]] || fail "broken .new should exit 1, got $rc"
+[[ "$("$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" --version)" \
+  == "runtug v8 (runtug-linux-arm64)" ]] \
+  || fail "old binary was replaced by a broken .new"
+pass "broken staged .new leaves the old binary in place"
 
 echo "PASS all fleet-install tests"

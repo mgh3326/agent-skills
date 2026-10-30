@@ -14,8 +14,9 @@ Replaces the desk's ad-hoc install script:
   4. install <tool>-<os>-<arch> for this host's detected arch into
      ~/.local/bin/<tool> (mode 755) and print `<tool> --version`;
   5. per --hosts entry: detect <os>-<arch> over ssh, scp the matching binary
-     to .local/bin/<tool>.new, then `chmod 755`, `mv -f` into place and print
-     `<tool> --version` (atomic replace);
+     to .local/bin/<tool>.new, validate it with `<tool>.new --version`, then
+     `mv -f` into place (atomic replace — a staged binary that cannot run
+     never replaces the working install);
   6. post-install restart hooks from the local config file (below) run for
      every target that installed.
 
@@ -57,6 +58,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+try:
+    import tomllib
+except ImportError:  # python < 3.11: the documented-subset parser below is used
+    tomllib = None
 
 PROG = "fleet-install"
 ORG = "mgh3326"
@@ -133,12 +139,63 @@ def checksum_tool():
 
 # --- local config (documented TOML subset) ---------------------------------
 
-_SECTION = re.compile(r"^\[tool\.([A-Za-z0-9_-]+)\.(local|host\.[A-Za-z0-9_-]+)\]\s*$")
+_SECTION = re.compile(
+    r"^\[tool\.([A-Za-z0-9_-]+)\.(local|host\.[A-Za-z0-9_.-]+)\]\s*$")
 _KEY = re.compile(r"^([A-Za-z_]+)\s*=\s*(.*)$")
+_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
-def load_restart_hooks(path, tool):
-    """Return {"local": [...], "<host>": [...]} restart command lists."""
+def _strip_comment(line):
+    """Drop a trailing # comment unless it is inside a "quoted" string."""
+    out = []
+    in_str = False
+    esc = False
+    for ch in line:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch == "#":
+            break
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _array_strings(value):
+    """Extract the quoted strings of a TOML array literal (subset parser)."""
+    return [json.loads(m.group(0)) for m in _STRING.finditer(value)]
+
+
+def _hooks_tomllib(path, tool):
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        die(f"cannot parse config {path}: {exc}", EXIT_USAGE)
+    hooks = {}
+    sections = data.get("tool", {}).get(tool, {})
+    hooks["local"] = list(sections.get("local", {}).get("restart", []))
+    for name, sub in sections.get("host", {}).items():
+        hooks[name] = list(sub.get("restart", []))
+    for target, commands in hooks.items():
+        if not all(isinstance(c, str) for c in commands):
+            die(f"config {path}: restart entries for {target} must be strings",
+                EXIT_USAGE)
+    return {k: v for k, v in hooks.items() if v}
+
+
+def _hooks_subset(path, tool):
+    """Fallback parser for the documented config subset (no tomllib)."""
     hooks = {}
     try:
         with open(path, encoding="utf-8") as handle:
@@ -151,19 +208,21 @@ def load_restart_hooks(path, tool):
     section = None
     i = 0
     while i < len(lines):
-        line = lines[i].strip()
+        line = _strip_comment(lines[i]).strip()
         i += 1
-        if not line or line.startswith("#"):
+        if not line:
             continue
         match = _SECTION.match(line)
         if match:
             sec_tool, sec_target = match.groups()
             if sec_tool == tool:
-                key = "local" if sec_target == "local" else sec_target[len("host."):]
-                section = key
+                section = "local" if sec_target == "local" else sec_target[len("host."):]
                 hooks.setdefault(section, [])
             else:
                 section = None
+            continue
+        if line.startswith("["):
+            section = None  # a header this subset does not know ends the section
             continue
         if section is None:
             continue
@@ -171,19 +230,26 @@ def load_restart_hooks(path, tool):
         if not kv:
             continue
         key, value = kv.groups()
-        while "]" not in value and i < len(lines):
-            value += lines[i].strip()
+        # Continue until the brackets balance outside quoted strings, so a
+        # ']' inside a command does not end the value early.
+        while value.count("[") - value.count("]") > 0 and i < len(lines):
+            value += _strip_comment(lines[i])
             i += 1
         if key == "restart":
             try:
-                commands = json.loads(value)
+                commands = _array_strings(value)
             except json.JSONDecodeError as exc:
-                die(f"config {path}: bad restart array in [{tool}.{section}]: {exc}",
-                    EXIT_USAGE)
-            if not all(isinstance(c, str) for c in commands):
-                die(f"config {path}: restart entries must be strings", EXIT_USAGE)
+                die(f"config {path}: bad restart array in section for "
+                    f"{section}: {exc}", EXIT_USAGE)
             hooks[section].extend(commands)
     return hooks
+
+
+def load_restart_hooks(path, tool):
+    """Return {"local": [...], "<host>": [...]} restart command lists."""
+    if tomllib is not None:
+        return _hooks_tomllib(path, tool)
+    return _hooks_subset(path, tool)
 
 
 # --- install steps ----------------------------------------------------------
@@ -192,6 +258,10 @@ def install_local(args):
     arch = local_arch()
     artifact = os.path.join(args.dir, f"{args.tool}-{arch}")
     target = os.path.join(args.bin_dir, args.tool)
+    if args.sums is not None and f"{args.tool}-{arch}" not in args.sums:
+        print(f"{PROG}: {args.tool}-{arch} is not listed in SHA256SUMS; "
+              f"refusing to install an unverified artifact", file=sys.stderr)
+        return False
     if args.dry_run:
         print(f"[dry-run] install -m 755 {artifact} {target}")
         print(f"[dry-run] {target} --version")
@@ -228,15 +298,21 @@ def install_host(args, host):
     if not os.path.isfile(artifact):
         print(f"{PROG}: {host}: no artifact for arch {arch}", file=sys.stderr)
         return False, arch
+    if args.sums is not None and f"{tool}-{arch}" not in args.sums:
+        print(f"{PROG}: {host}: {tool}-{arch} is not listed in SHA256SUMS; "
+              f"refusing to install an unverified artifact", file=sys.stderr)
+        return False, arch
     proc = run([args.scp, artifact, f"{host}:.local/bin/{tool}.new"])
     if proc.returncode != 0:
         print(f"{PROG}: {host}: scp failed: {proc.stderr.strip()}",
               file=sys.stderr)
         return False, arch
+    # Validate the staged .new before it replaces the working binary: if
+    # --version fails the old install stays untouched and .new is dropped.
     remote = (
         f"chmod 755 ~/.local/bin/{tool}.new && "
-        f"mv -f ~/.local/bin/{tool}.new ~/.local/bin/{tool} && "
-        f"~/.local/bin/{tool} --version"
+        f"~/.local/bin/{tool}.new --version && "
+        f"mv -f ~/.local/bin/{tool}.new ~/.local/bin/{tool}"
     )
     proc = run([args.ssh, "-n", host, remote])
     out = (proc.stdout + proc.stderr).strip()
@@ -296,6 +372,10 @@ def main():
         os.path.expanduser("~/.config/wrk/fleet-install.toml"))
     hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
 
+    # Config errors are usage errors: surface them before the (potentially
+    # long) release wait and download.
+    hooks = load_restart_hooks(config, args.tool)
+
     wait_for_release(args.gh, args.tool, args.tag,
                      args.wait_timeout, args.poll_interval, args.dry_run)
 
@@ -305,6 +385,7 @@ def main():
             print(f"[dry-run] gh release download {args.tag} -R "
                   f"{ORG}/{args.tool} --clobber --dir <tmp>")
             print(f"[dry-run] {' '.join(checksum_tool())}")
+            args.sums = None
         else:
             proc = run([args.gh, "release", "download", args.tag,
                         "-R", f"{ORG}/{args.tool}", "--clobber", "--dir", tmp])
@@ -315,8 +396,16 @@ def main():
             if proc.returncode != 0:
                 sys.stderr.write(proc.stdout + proc.stderr)
                 die("checksum verification failed", EXIT_FETCH)
+            # Every artifact installed must have been covered by SHA256SUMS;
+            # `shasum -c` verifies listed files but says nothing about assets
+            # missing from the list.
+            args.sums = set()
+            with open(os.path.join(tmp, "SHA256SUMS"), encoding="utf-8") as sf:
+                for line in sf:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        args.sums.add(parts[-1].lstrip("*"))
 
-        hooks = load_restart_hooks(config, args.tool)
         failed = []
 
         if install_local(args):
