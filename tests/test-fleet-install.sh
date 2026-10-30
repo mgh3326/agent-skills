@@ -202,4 +202,23 @@ unset FLEET_INSTALL_FAKE_BROKEN
   || fail "old binary was replaced by a broken .new"
 pass "broken staged .new leaves the old binary in place"
 
+# ── 9. --workflow is forwarded to gh run list ────────────────────────────
+reset_env
+mk_release runtug v9 "$LA"
+"$FLEET_INSTALL" runtug v9 --workflow release.yml >/dev/null
+grep -q "run list .*--workflow release.yml" "$FLEET_INSTALL_GH_LOG" \
+  || fail "--workflow not forwarded to gh run list"
+pass "--workflow forwarded to gh run list"
+
+# ── 10. non-array restart is a usage error, not a crash ──────────────────
+reset_env
+mk_release runtug v9 "$LA"
+printf '[tool.runtug.local]\nrestart = "oops"\n' >"$FLEET_INSTALL_CONFIG"
+set +e
+out="$("$FLEET_INSTALL" runtug v9 2>&1)"
+rc=$?
+set -e
+[[ $rc -eq 2 ]] || fail "scalar restart should exit 2, got $rc: $out"
+pass "non-array restart exits 2"
+
 echo "PASS all fleet-install tests"

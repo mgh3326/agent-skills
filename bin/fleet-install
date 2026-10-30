@@ -2,13 +2,16 @@
 """fleet-install — install one tagged fleet-tool release on this host and remotes.
 
 usage: fleet-install <tool> <tag> [--hosts a,b] [--dry-run]
-                     [--wait-timeout S] [--poll-interval S]
+                     [--workflow NAME] [--wait-timeout S] [--poll-interval S]
 
 Replaces the desk's ad-hoc install script:
 
   1. wait for the release workflow run for headBranch <tag> in
-     mgh3326/<tool> to complete (bounded by --wait-timeout; the run may not
-     exist yet when a tag is fresh, so an empty list keeps polling);
+     mgh3326/<tool> to complete (bounded by --wait-timeout, including each
+     `gh` call; the run may not exist yet when a tag is fresh, so an empty
+     list keeps polling). --workflow restricts the wait to one workflow —
+     name it per the tool repo's release workflow (the name is local
+     knowledge, not this repo's);
   2. `gh release download <tag> -R mgh3326/<tool> --clobber` into a temp dir;
   3. `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c`) — required, never skipped;
   4. install <tool>-<os>-<arch> for this host's detected arch into
@@ -96,18 +99,25 @@ def local_arch():
     return f"{system}-{machine}"
 
 
-def wait_for_release(gh, tool, tag, timeout, interval, dry_run):
+def wait_for_release(gh, tool, tag, timeout, interval, dry_run, workflow=None):
     """Poll `gh run list` until the headBranch=<tag> run completes."""
     deadline = time.monotonic() + timeout
+    argv = [
+        gh, "run", "list", "-R", f"{ORG}/{tool}",
+        "--branch", tag, "--limit", "1",
+        "--json", "status,conclusion,headBranch",
+    ]
+    if workflow:
+        argv += ["--workflow", workflow]
     while True:
         if dry_run:
             print(f"[dry-run] wait for release run of {ORG}/{tool} headBranch {tag}")
             return
-        proc = run([
-            gh, "run", "list", "-R", f"{ORG}/{tool}",
-            "--branch", tag, "--limit", "1",
-            "--json", "status,conclusion,headBranch",
-        ])
+        try:
+            proc = run(argv, timeout=max(1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            die(f"timed out after {timeout}s waiting for the release run of "
+                f"{ORG}/{tool} headBranch {tag}", EXIT_FETCH)
         if proc.returncode == 0:
             try:
                 runs = json.loads(proc.stdout or "[]")
@@ -184,14 +194,15 @@ def _hooks_tomllib(path, tool):
         die(f"cannot parse config {path}: {exc}", EXIT_USAGE)
     hooks = {}
     sections = data.get("tool", {}).get(tool, {})
-    hooks["local"] = list(sections.get("local", {}).get("restart", []))
+    hooks["local"] = sections.get("local", {}).get("restart", [])
     for name, sub in sections.get("host", {}).items():
-        hooks[name] = list(sub.get("restart", []))
+        hooks[name] = sub.get("restart", [])
     for target, commands in hooks.items():
-        if not all(isinstance(c, str) for c in commands):
-            die(f"config {path}: restart entries for {target} must be strings",
-                EXIT_USAGE)
-    return {k: v for k, v in hooks.items() if v}
+        if not isinstance(commands, list) or \
+                not all(isinstance(c, str) for c in commands):
+            die(f"config {path}: restart for {target} must be an array of "
+                f"strings", EXIT_USAGE)
+    return {k: list(v) for k, v in hooks.items() if v}
 
 
 def _hooks_subset(path, tool):
@@ -236,6 +247,9 @@ def _hooks_subset(path, tool):
             value += _strip_comment(lines[i])
             i += 1
         if key == "restart":
+            if not value.lstrip().startswith("["):
+                die(f"config {path}: restart for {section} must be an array "
+                    f"of strings", EXIT_USAGE)
             try:
                 commands = _array_strings(value)
             except json.JSONDecodeError as exc:
@@ -270,10 +284,26 @@ def install_local(args):
         print(f"{PROG}: no artifact for this host's arch: "
               f"{args.tool}-{arch}", file=sys.stderr)
         return False
-    os.makedirs(args.bin_dir, exist_ok=True)
-    proc = run(["install", "-m", "755", artifact, target])
+    try:
+        os.makedirs(args.bin_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"{PROG}: cannot create {args.bin_dir}: {exc}", file=sys.stderr)
+        return False
+    # Stage to a sibling path and rename: an interrupted install must not
+    # leave a truncated binary at the live path.
+    staged = target + ".new"
+    proc = run(["install", "-m", "755", artifact, staged])
     if proc.returncode != 0:
         print(f"{PROG}: install failed: {proc.stderr.strip()}", file=sys.stderr)
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(staged, target)
+    except OSError as exc:
+        print(f"{PROG}: cannot promote {staged}: {exc}", file=sys.stderr)
         return False
     ver = run([target, "--version"])
     print(ver.stdout.strip() or ver.stderr.strip())
@@ -354,6 +384,10 @@ def main():
     parser.add_argument("--hosts", default="",
                         help="comma-separated remote host names")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--workflow", default=os.environ.get(
+                            "FLEET_INSTALL_WORKFLOW", ""),
+                        help="release workflow name/file to wait on "
+                             "(default: any workflow on the tag branch)")
     parser.add_argument("--wait-timeout", type=int,
                         default=int(os.environ.get(
                             "FLEET_INSTALL_WAIT_TIMEOUT", DEFAULT_WAIT_TIMEOUT)))
@@ -377,7 +411,8 @@ def main():
     hooks = load_restart_hooks(config, args.tool)
 
     wait_for_release(args.gh, args.tool, args.tag,
-                     args.wait_timeout, args.poll_interval, args.dry_run)
+                     args.wait_timeout, args.poll_interval, args.dry_run,
+                     workflow=args.workflow)
 
     with tempfile.TemporaryDirectory(prefix=f"{args.tool}-{args.tag}-") as tmp:
         args.dir = tmp

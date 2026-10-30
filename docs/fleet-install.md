@@ -15,14 +15,16 @@ What it does, in order:
 
 1. Polls `gh run list -R mgh3326/<tool> --branch <tag>` until the release
    workflow run for headBranch `<tag>` completes (`--wait-timeout`, default
-   1800s; a fresh tag may not have a run row yet, so an empty list keeps
-   polling). A non-success conclusion is an error.
+   1800s, bounding each `gh` call too; a fresh tag may not have a run row
+   yet, so an empty list keeps polling). A non-success conclusion is an
+   error. `--workflow NAME` restricts the wait to one workflow — pass the
+   tool repo's release workflow name when a tag branch can trigger others.
 2. `gh release download <tag> -R mgh3326/<tool> --clobber` into a temp dir.
 3. `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c`). Required, never skipped —
    and every artifact about to be installed must be listed in it.
-4. Detects this host's `<os>-<arch>` (`uname`, x86_64→amd64, aarch64→arm64) and
-   `install -m 755 <tool>-<os>-<arch> ~/.local/bin/<tool>`, then prints
-   `<tool> --version`.
+4. Detects this host's `<os>-<arch>` (`uname`, x86_64→amd64, aarch64→arm64),
+   stages `install -m 755` to `~/.local/bin/<tool>.new` and renames it into
+   place, then prints `<tool> --version`.
 5. Per `--hosts` entry: probes `<os>-<arch>` over ssh, `scp` the matching
    binary to `.local/bin/<tool>.new`, runs `<tool>.new --version` to validate
    it, then `mv -f` into place (atomic replace). If the staged binary cannot
