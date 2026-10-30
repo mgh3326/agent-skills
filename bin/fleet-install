@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""fleet-install — install one tagged fleet-tool release on this host and remotes.
+
+usage: fleet-install <tool> <tag> [--hosts a,b] [--dry-run]
+                     [--wait-timeout S] [--poll-interval S]
+
+Replaces the desk's ad-hoc install script:
+
+  1. wait for the release workflow run for headBranch <tag> in
+     mgh3326/<tool> to complete (bounded by --wait-timeout; the run may not
+     exist yet when a tag is fresh, so an empty list keeps polling);
+  2. `gh release download <tag> -R mgh3326/<tool> --clobber` into a temp dir;
+  3. `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c`) — required, never skipped;
+  4. install <tool>-<os>-<arch> for this host's detected arch into
+     ~/.local/bin/<tool> (mode 755) and print `<tool> --version`;
+  5. per --hosts entry: detect <os>-<arch> over ssh, scp the matching binary
+     to .local/bin/<tool>.new, then `chmod 755`, `mv -f` into place and print
+     `<tool> --version` (atomic replace);
+  6. post-install restart hooks from the local config file (below) run for
+     every target that installed.
+
+Host names, restart commands and which daemon runs where live ONLY in the
+local config — this repo is public. Default path:
+
+  ~/.config/wrk/fleet-install.toml   (override: FLEET_INSTALL_CONFIG)
+
+Config format (TOML subset: `key = ["a", "b"]` string arrays under bracket
+sections; see docs/fleet-install.md for an example without real hosts):
+
+  [tool.mergewake.local]          # hooks on the operator host, run via sh -c
+  restart = ["launchctl kickstart -k gui/$(id -u)/<label>"]
+
+  [tool.mergewake.host.example-b] # hooks on --hosts entry example-b, via ssh
+  restart = ["systemctl --user restart mergewake.service"]
+
+exit code
+  0  every target installed (and restarted, where configured)
+  1  at least one --hosts entry or the local install failed
+  2  usage error
+  3  release wait timed out or failed, download/checksum error
+
+env overrides (tests):
+  FLEET_INSTALL_GH / FLEET_INSTALL_SSH / FLEET_INSTALL_SCP
+  FLEET_INSTALL_CONFIG / FLEET_INSTALL_BIN_DIR
+  FLEET_INSTALL_WAIT_TIMEOUT / FLEET_INSTALL_POLL_INTERVAL
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+PROG = "fleet-install"
+ORG = "mgh3326"
+
+EXIT_HOST_FAILED = 1
+EXIT_USAGE = 2
+EXIT_FETCH = 3
+
+DEFAULT_WAIT_TIMEOUT = 1800
+DEFAULT_POLL_INTERVAL = 15
+
+REMOTE_ARCH_CMD = (
+    "echo $(uname -s | tr A-Z a-z)-"
+    "$(uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/)"
+)
+
+
+def run(argv, **kw):
+    return subprocess.run(argv, text=True, capture_output=True, **kw)
+
+
+def die(msg, code):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def local_arch():
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+    return f"{system}-{machine}"
+
+
+def wait_for_release(gh, tool, tag, timeout, interval, dry_run):
+    """Poll `gh run list` until the headBranch=<tag> run completes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if dry_run:
+            print(f"[dry-run] wait for release run of {ORG}/{tool} headBranch {tag}")
+            return
+        proc = run([
+            gh, "run", "list", "-R", f"{ORG}/{tool}",
+            "--branch", tag, "--limit", "1",
+            "--json", "status,conclusion,headBranch",
+        ])
+        if proc.returncode == 0:
+            try:
+                runs = json.loads(proc.stdout or "[]")
+            except json.JSONDecodeError:
+                runs = []
+            if runs:
+                run_info = runs[0]
+                status = run_info.get("status")
+                if status == "completed":
+                    conclusion = run_info.get("conclusion")
+                    if conclusion != "success":
+                        die(f"release run for {tag} completed with conclusion "
+                            f"{conclusion!r}", EXIT_FETCH)
+                    return
+        if time.monotonic() + interval > deadline:
+            die(f"timed out after {timeout}s waiting for the release run of "
+                f"{ORG}/{tool} headBranch {tag}", EXIT_FETCH)
+        time.sleep(interval)
+
+
+def checksum_tool():
+    if shutil.which("shasum"):
+        return ["shasum", "-a", "256", "-c", "SHA256SUMS"]
+    if shutil.which("sha256sum"):
+        return ["sha256sum", "-c", "SHA256SUMS"]
+    die("neither shasum nor sha256sum found; checksum verification is required",
+        EXIT_FETCH)
+
+
+# --- local config (documented TOML subset) ---------------------------------
+
+_SECTION = re.compile(r"^\[tool\.([A-Za-z0-9_-]+)\.(local|host\.[A-Za-z0-9_-]+)\]\s*$")
+_KEY = re.compile(r"^([A-Za-z_]+)\s*=\s*(.*)$")
+
+
+def load_restart_hooks(path, tool):
+    """Return {"local": [...], "<host>": [...]} restart command lists."""
+    hooks = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return hooks
+    except OSError as exc:
+        die(f"cannot read config {path}: {exc}", EXIT_USAGE)
+
+    section = None
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        match = _SECTION.match(line)
+        if match:
+            sec_tool, sec_target = match.groups()
+            if sec_tool == tool:
+                key = "local" if sec_target == "local" else sec_target[len("host."):]
+                section = key
+                hooks.setdefault(section, [])
+            else:
+                section = None
+            continue
+        if section is None:
+            continue
+        kv = _KEY.match(line)
+        if not kv:
+            continue
+        key, value = kv.groups()
+        while "]" not in value and i < len(lines):
+            value += lines[i].strip()
+            i += 1
+        if key == "restart":
+            try:
+                commands = json.loads(value)
+            except json.JSONDecodeError as exc:
+                die(f"config {path}: bad restart array in [{tool}.{section}]: {exc}",
+                    EXIT_USAGE)
+            if not all(isinstance(c, str) for c in commands):
+                die(f"config {path}: restart entries must be strings", EXIT_USAGE)
+            hooks[section].extend(commands)
+    return hooks
+
+
+# --- install steps ----------------------------------------------------------
+
+def install_local(args):
+    arch = local_arch()
+    artifact = os.path.join(args.dir, f"{args.tool}-{arch}")
+    target = os.path.join(args.bin_dir, args.tool)
+    if args.dry_run:
+        print(f"[dry-run] install -m 755 {artifact} {target}")
+        print(f"[dry-run] {target} --version")
+        return True
+    if not os.path.isfile(artifact):
+        print(f"{PROG}: no artifact for this host's arch: "
+              f"{args.tool}-{arch}", file=sys.stderr)
+        return False
+    os.makedirs(args.bin_dir, exist_ok=True)
+    proc = run(["install", "-m", "755", artifact, target])
+    if proc.returncode != 0:
+        print(f"{PROG}: install failed: {proc.stderr.strip()}", file=sys.stderr)
+        return False
+    ver = run([target, "--version"])
+    print(ver.stdout.strip() or ver.stderr.strip())
+    return ver.returncode == 0
+
+
+def install_host(args, host):
+    """Install on one remote. Returns (ok, arch)."""
+    tool = args.tool
+    if args.dry_run:
+        print(f"[dry-run] ssh -n {host} '{REMOTE_ARCH_CMD}'")
+        print(f"[dry-run] scp {tool}-<arch> {host}:.local/bin/{tool}.new; "
+              f"chmod+mv+--version over ssh")
+        return True, None
+    proc = run([args.ssh, "-n", host, REMOTE_ARCH_CMD])
+    arch = proc.stdout.strip()
+    if proc.returncode != 0 or not arch:
+        print(f"{PROG}: {host}: arch probe failed: {proc.stderr.strip()}",
+              file=sys.stderr)
+        return False, None
+    artifact = os.path.join(args.dir, f"{tool}-{arch}")
+    if not os.path.isfile(artifact):
+        print(f"{PROG}: {host}: no artifact for arch {arch}", file=sys.stderr)
+        return False, arch
+    proc = run([args.scp, artifact, f"{host}:.local/bin/{tool}.new"])
+    if proc.returncode != 0:
+        print(f"{PROG}: {host}: scp failed: {proc.stderr.strip()}",
+              file=sys.stderr)
+        return False, arch
+    remote = (
+        f"chmod 755 ~/.local/bin/{tool}.new && "
+        f"mv -f ~/.local/bin/{tool}.new ~/.local/bin/{tool} && "
+        f"~/.local/bin/{tool} --version"
+    )
+    proc = run([args.ssh, "-n", host, remote])
+    out = (proc.stdout + proc.stderr).strip()
+    if out:
+        print(f"{host}: {out}")
+    if proc.returncode != 0:
+        print(f"{PROG}: {host}: activate failed", file=sys.stderr)
+        return False, arch
+    return True, arch
+
+
+def run_restarts(args, target, commands):
+    """Run restart hooks for one target ('local' or a host name)."""
+    ok = True
+    for cmd in commands:
+        if args.dry_run:
+            where = "local sh -c" if target == "local" else f"ssh {target}"
+            print(f"[dry-run] restart ({where}): {cmd}")
+            continue
+        if target == "local":
+            proc = run(["sh", "-c", cmd])
+        else:
+            proc = run([args.ssh, "-n", target, cmd])
+        if proc.returncode != 0:
+            print(f"{PROG}: {target}: restart failed ({cmd}): "
+                  f"{proc.stderr.strip()}", file=sys.stderr)
+            ok = False
+    return ok
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Install one tagged fleet-tool release on this host and remotes.",
+        epilog=__doc__)
+    parser.add_argument("tool")
+    parser.add_argument("tag")
+    parser.add_argument("--hosts", default="",
+                        help="comma-separated remote host names")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--wait-timeout", type=int,
+                        default=int(os.environ.get(
+                            "FLEET_INSTALL_WAIT_TIMEOUT", DEFAULT_WAIT_TIMEOUT)))
+    parser.add_argument("--poll-interval", type=int,
+                        default=int(os.environ.get(
+                            "FLEET_INSTALL_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)))
+    args = parser.parse_args()
+
+    args.gh = os.environ.get("FLEET_INSTALL_GH", "gh")
+    args.ssh = os.environ.get("FLEET_INSTALL_SSH", "ssh")
+    args.scp = os.environ.get("FLEET_INSTALL_SCP", "scp")
+    args.bin_dir = os.environ.get(
+        "FLEET_INSTALL_BIN_DIR", os.path.expanduser("~/.local/bin"))
+    config = os.environ.get(
+        "FLEET_INSTALL_CONFIG",
+        os.path.expanduser("~/.config/wrk/fleet-install.toml"))
+    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+
+    wait_for_release(args.gh, args.tool, args.tag,
+                     args.wait_timeout, args.poll_interval, args.dry_run)
+
+    with tempfile.TemporaryDirectory(prefix=f"{args.tool}-{args.tag}-") as tmp:
+        args.dir = tmp
+        if args.dry_run:
+            print(f"[dry-run] gh release download {args.tag} -R "
+                  f"{ORG}/{args.tool} --clobber --dir <tmp>")
+            print(f"[dry-run] {' '.join(checksum_tool())}")
+        else:
+            proc = run([args.gh, "release", "download", args.tag,
+                        "-R", f"{ORG}/{args.tool}", "--clobber", "--dir", tmp])
+            if proc.returncode != 0:
+                die(f"gh release download failed: {proc.stderr.strip()}",
+                    EXIT_FETCH)
+            proc = run(checksum_tool(), cwd=tmp)
+            if proc.returncode != 0:
+                sys.stderr.write(proc.stdout + proc.stderr)
+                die("checksum verification failed", EXIT_FETCH)
+
+        hooks = load_restart_hooks(config, args.tool)
+        failed = []
+
+        if install_local(args):
+            if not run_restarts(args, "local", hooks.get("local", [])):
+                failed.append("local")
+        else:
+            failed.append("local")
+
+        for host in hosts:
+            ok, _arch = install_host(args, host)
+            if ok and not run_restarts(args, host, hooks.get(host, [])):
+                ok = False
+            if not ok:
+                failed.append(host)
+
+    if failed:
+        print(f"{PROG}: failed targets: {', '.join(failed)}", file=sys.stderr)
+        sys.exit(EXIT_HOST_FAILED)
+    print(f"{PROG}: {args.tool} {args.tag} installed")
+
+
+if __name__ == "__main__":
+    main()

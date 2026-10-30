@@ -13,6 +13,7 @@ suites-b|bash tests/test-ops-wake-contract.sh
 suites-b|bash tests/test-install-prune.sh
 suites-b|bash tests/test-area-propose.sh
 suites-b|bash tests/test-ci-suites.sh
+suites-b|bash tests/test-fleet-install.sh
 suites-b|bash tests/test-ci-any-ref.sh
 suites-b|bash tests/needs-full-macos.sh
 python|python3 -m unittest tests/test_pa_review_scan.py -v

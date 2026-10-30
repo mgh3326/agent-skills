@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fake scp for fleet-install tests: `scp <file> <alias>:<path>` copies <file>
+# to <path> under the per-alias fixture home.
+#
+#   FLEET_INSTALL_SCP_LOG     append one argv line per call (default /dev/null)
+#   FLEET_INSTALL_FAKE_ROOT   required: per-alias fixture homes
+#   FLEET_INSTALL_FAKE_DEAD   comma list of aliases that fail with exit 255
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${FLEET_INSTALL_SCP_LOG:-/dev/null}"
+
+src="${1:?fake scp: missing source}"
+dst="${2:?fake scp: missing dest}"
+alias="${dst%%:*}"
+path="${dst#*:}"
+
+case ",${FLEET_INSTALL_FAKE_DEAD:-}," in
+  *,"$alias",*) exit 255 ;;
+esac
+
+home="${FLEET_INSTALL_FAKE_ROOT:?}/$(printf '%s' "$alias" | tr -c 'A-Za-z0-9_-' '_')"
+[[ -d "$home" ]] || { echo "fake scp: no fixture home for alias $alias" >&2; exit 254; }
+mkdir -p "$home/$(dirname "$path")"
+cp "$src" "$home/$path"

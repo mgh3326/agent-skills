@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Fake gh for fleet-install tests. Answers the two gh shapes fleet-install
+# uses from fixture files under FLEET_INSTALL_FAKE_DIR:
+#
+#   run list -R mgh3326/<tool> --branch <tag> --limit 1 --json ...
+#     Prints the first line of <tool>.runs and removes it (a poll sequence);
+#     else prints <tool>.run verbatim; else '[]' (no run yet).
+#   release download <tag> -R mgh3326/<tool> --clobber --dir <d>
+#     For each artifact name in <tool>.release (one per line) writes an
+#     executable stub script into <d> plus a SHA256SUMS covering all of them.
+#     FLEET_INSTALL_FAKE_BADSHA=1 corrupts the sums. No <tool>.release -> rc1.
+#
+#   FLEET_INSTALL_GH_LOG    append one argv line per call (default /dev/null)
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${FLEET_INSTALL_GH_LOG:-/dev/null}"
+dir="${FLEET_INSTALL_FAKE_DIR:?}"
+
+sha_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    sha256sum "$1" | cut -d' ' -f1
+  fi
+}
+
+case "${1:-}" in
+  run)
+    # gh run list -R mgh3326/<tool> --branch <tag> ...
+    repo=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -R) repo="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    tool="${repo#mgh3326/}"
+    if [[ -f "$dir/$tool.runs" ]]; then
+      head -n1 "$dir/$tool.runs"
+      tail -n +2 "$dir/$tool.runs" >"$dir/$tool.runs.tmp" || true
+      mv "$dir/$tool.runs.tmp" "$dir/$tool.runs"
+    elif [[ -f "$dir/$tool.run" ]]; then
+      cat "$dir/$tool.run"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  release)
+    # gh release download <tag> -R mgh3326/<tool> --clobber --dir <d>
+    [[ "${2:-}" == "download" ]] || { echo "fake gh: expected 'release download'" >&2; exit 3; }
+    tag="${3:?fake gh: missing tag}"
+    repo=""; dest=""
+    shift 3
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -R) repo="$2"; shift 2 ;;
+        --dir) dest="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    tool="${repo#mgh3326/}"
+    manifest="$dir/$tool.release"
+    [[ -f "$manifest" ]] || { echo "gh: release not found" >&2; exit 1; }
+    mkdir -p "$dest"
+    : >"$dest/SHA256SUMS"
+    while read -r name; do
+      [[ -n "${name:-}" && "$name" != \#* ]] || continue
+      printf '#!/bin/sh\necho "%s %s (%s)"\n' "$tool" "$tag" "$name" >"$dest/$name"
+      chmod 755 "$dest/$name"
+    done <"$manifest"
+    while read -r name; do
+      [[ -n "${name:-}" && "$name" != \#* ]] || continue
+      sum="$(sha_file "$dest/$name")"
+      if [[ "${FLEET_INSTALL_FAKE_BADSHA:-}" == 1 ]]; then
+        sum="0${sum#?}"
+      fi
+      printf '%s  %s\n' "$sum" "$name" >>"$dest/SHA256SUMS"
+    done <"$manifest"
+    ;;
+  *)
+    echo "fake gh: unsupported: $*" >&2
+    exit 3
+    ;;
+esac

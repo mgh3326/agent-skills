@@ -69,9 +69,13 @@ jobs:
             tests/test-area-propose.sh \
             tests/test-ci-suites.sh \
             tests/test-ci-any-ref.sh \
+            tests/test-fleet-install.sh \
             tests/needs-full-macos.sh \
             scripts/needs-full-macos \
             scripts/resolve-ci-ref \
+            tests/fixtures/fleet-install/gh \
+            tests/fixtures/fleet-install/ssh \
+            tests/fixtures/fleet-install/scp \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Fake ssh for fleet-install tests. Records argv, honours a dead-alias list,
+# answers the arch probe from a per-host fixture file, and runs any other
+# remote command under a per-alias fixture HOME:
+#
+#   FLEET_INSTALL_SSH_LOG     append one argv line per call (default /dev/null)
+#   FLEET_INSTALL_FAKE_ROOT   required: dir holding one fixture home per alias,
+#                             keyed by tr -c 'A-Za-z0-9_-' '_'
+#   FLEET_INSTALL_FAKE_DEAD   comma list of aliases that fail with exit 255
+#
+#   <home>/arch               if present, printed for the uname arch probe
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${FLEET_INSTALL_SSH_LOG:-/dev/null}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -n) shift ;;
+    --) shift ;;
+    *) break ;;
+  esac
+done
+alias="${1:?fake ssh: missing alias}"
+shift
+cmd="$*"
+
+case ",${FLEET_INSTALL_FAKE_DEAD:-}," in
+  *,"$alias",*) exit 255 ;;
+esac
+
+home="${FLEET_INSTALL_FAKE_ROOT:?}/$(printf '%s' "$alias" | tr -c 'A-Za-z0-9_-' '_')"
+[[ -d "$home" ]] || { echo "fake ssh: no fixture home for alias $alias" >&2; exit 254; }
+
+case "$cmd" in
+  *"uname -s"*)
+    if [[ -f "$home/arch" ]]; then
+      cat "$home/arch"
+      exit 0
+    fi ;;
+esac
+
+HOME="$home" sh -c "$cmd"
