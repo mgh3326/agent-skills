@@ -6,3 +6,4 @@ bash tests/test-arbiter.sh
 # Path|smoke command (or - when the full macOS suite is required)|Darwin-sensitive reason
 [darwin-sensitive]
 bin/arbiter|bash tests/test-arbiter.sh|Arbiter resolves trust paths and temp roots, including macOS /private/tmp and /var/folders aliases.
+bin/fleet-install|-|fleet-install installs binaries on the operator host (Darwin) and maps uname output to release arch names.
