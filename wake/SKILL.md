@@ -328,7 +328,7 @@ Environment: <test DB | dry-run | production (operator present)>
 <numbered observable checks: command → expected output>
 
 ## Rules
-- Small PR. No direct merge. Tests narrowly; anything over 1 min via `runtug heavy -- <cmd>`.
+- Small PR. No direct merge. Run only the tests for what you changed; full suites belong to CI.
 - A pushed branch catches up with `git merge origin/main`; never rebase or force-push it.
 - Commit and PR body end with these trailers:
   Mergewake-Author-Family: <anthropic|openai|google|…>

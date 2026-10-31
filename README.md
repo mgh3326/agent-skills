@@ -45,7 +45,7 @@ mutation 등)의 구체 사례에서 뽑아 도메인 무관 형태로 추상화
 `consult-advisor`·`spawn-worker`·`builder`는 삭제됐다(호환 stub 없음). 옮겨 간 곳:
 relay-handoff → `ops/references/relay.md`(+`session-questions.md`), consult-advisor → `consult.md`,
 installer → `deploy.md`(+`deploy-checklist.md`), spawn-worker §4·§4.x·§6 → `spawn.md`·`spawn-hosts.md`·
-`heavy.md`·`reap.md`, director 결정 요청·감시 → `decision-request.md`·`watching.md`·`panewire-events.md`,
+`reap.md`, director 결정 요청·감시 → `decision-request.md`·`watching.md`·`panewire-events.md`,
 spawn-worker §1~§3·builder 루프·director 권한·머지 게이트 → `wake`. planner·architect·linear-archive·node-ops·
 checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의존하던 `director/` 게이트(tester-eligible·merge-precheck)는 runtug 로 대체되며 삭제됐다. `director/gate_policy.json` 은 `local_sources` 해시 핀(ci.yml docs-only 분류기와 wake 가 읽음)만 남겼다.
 원문 복원: `git log --diff-filter=D --format=%H -1 -- <스킬>/SKILL.md`로 삭제 커밋을 찾고
