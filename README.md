@@ -57,8 +57,9 @@ checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의�
 [michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude)(MIT) 커밋 `5851c89`의 Claude Code 빌드 스킬을
 복사했다(심링크·서브모듈 아님, `PINNED` 참조). 실행 파일(bun/TypeScript 도구·훅·셸 스크립트)은 싣지 않았고 제외 목록은 `PINNED`에 있다.
 충돌하는 지시와 그 무력화 방법은 `third_party/pstack/REVIEW.md`. 버전 올림은 diff를 코드처럼 리뷰한다.
-`install.sh`는 `third_party/pstack/INSTALL`에 적힌 스킬(`how`·`architect`·`blast-radius`·`tdd`)만 링크한다 —
-스킬 설명이 매 세션 컨텍스트에 실리므로 허용 목록이다. 나머지는 상대 링크로 읽을 수만 있다.
+`install.sh`는 `third_party/pstack/INSTALL`에 적힌 48개 스킬(`principle-*` 전부, `how`·`why`·`architect`·`blast-radius`·`tdd` 등)만 링크한다.
+`poteto-mode`·`poteto-help`·`setup-pstack`·`swarm`·`arena`·`automate-me`·`ketchup`·`ketchup-video`·`bro`는 제외 — 나머지는 상대 링크로 읽을 수만 있다.
+스킬 설명이 매 세션 컨텍스트에 실리는 비용은 운영자 결정으로 감수한다(`REVIEW.md` 참조).
 `./install.sh --dry-run`은 아무것도 쓰지 않고 만들 링크만 보여준다(codex는 `~/.agents/skills`를 직접 스캔하고, 중첩된 벤더링 스킬은 `~/.codex/skills`에 따로 링크).
 
 ## 로드 경로 (2026-07-29 실측)
