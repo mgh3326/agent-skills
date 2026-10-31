@@ -326,6 +326,11 @@ Worktree: ~/work/<repo>.<slug> (branch wk/<slug>, base origin/main). Grade <G>, 
 Expected: <duration>  (hk task --expected; quota stops wait only if the reset falls within it)
 Environment: <test DB | dry-run | production (operator present)>
 
+Work in `robin-mode` (rstack): restate the goal, name the data shape, pick one playbook, prove
+it against the real artifact. Use your own subagents (or `runtug delegate` once available) for
+exploration and verification; do not spawn other workers for this task, and fix your own review
+findings.
+
 ## Do
 <numbered instructions>
 
