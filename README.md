@@ -33,6 +33,7 @@ mutation 등)의 구체 사례에서 뽑아 도메인 무관 형태로 추상화
 | 스킬 | 용도 |
 |---|---|
 | `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드 없음, 워커 브리프 템플릿 포함 |
+| `fleet-review` | 리뷰 지적 처리 — fix/dismiss/defer 기준표, repo별 학습 skip 패턴(`.mergewake/triage-patterns.md`), "판정은 SHA가 아니라 패치를 덮는다"(patch-id), poteto-mode 3원칙(목표 재진술·데이터 모양·실물 증명), 벤더링한 pstack보다 fleet 브리프·`wake`가 우선한다는 선언 |
 | `ops` | 레인 기계학 — 스폰·착지 확인, 릴레이·주입(5요소·`comms-contract: v1`), 자문, 결정 요청, 결정 ESC(pane 질문 금지), 폴링 없는 대기, 회수, 배포 1건(installer 좌석, operator-desk 직속). `SKILL.md`는 라우팅 표, 절차는 `ops/references/` |
 
 스킬 간 관계: `wake`는 무엇을 언제 끝낼지(티어·브리프·머지 게이트)를, `ops`는 그 과정의 기계학을 담당한다.
@@ -50,6 +51,15 @@ spawn-worker §1~§3·builder 루프·director 권한·머지 게이트 → `wak
 checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의존하던 `director/` 게이트(tester-eligible·merge-precheck)는 runtug 로 대체되며 삭제됐다. `director/gate_policy.json` 은 `local_sources` 해시 핀(ci.yml docs-only 분류기와 wake 가 읽음)만 남겼다.
 원문 복원: `git log --diff-filter=D --format=%H -1 -- <스킬>/SKILL.md`로 삭제 커밋을 찾고
 `git show <그 커밋>^:<스킬>/SKILL.md`.
+
+## 벤더링한 pstack (`third_party/pstack/`)
+
+[michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude)(MIT) 커밋 `5851c89`의 Claude Code 빌드 스킬을
+복사했다(심링크·서브모듈 아님, `PINNED` 참조). 실행 파일(bun/TypeScript 도구·훅·셸 스크립트)은 싣지 않았고 제외 목록은 `PINNED`에 있다.
+충돌하는 지시와 그 무력화 방법은 `third_party/pstack/REVIEW.md`. 버전 올림은 diff를 코드처럼 리뷰한다.
+`install.sh`는 `third_party/pstack/INSTALL`에 적힌 스킬(`how`·`architect`·`blast-radius`·`tdd`)만 링크한다 —
+스킬 설명이 매 세션 컨텍스트에 실리므로 허용 목록이다. 나머지는 상대 링크로 읽을 수만 있다.
+`./install.sh --dry-run`은 아무것도 쓰지 않고 만들 링크만 보여준다(codex는 `~/.agents/skills`를 직접 스캔하고, 중첩된 벤더링 스킬은 `~/.codex/skills`에 따로 링크).
 
 ## 로드 경로 (2026-07-29 실측)
 

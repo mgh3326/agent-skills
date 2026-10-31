@@ -1,11 +1,17 @@
 #!/bin/bash
 # agent-skills 설치 — 심링크 생성 + 끊긴 심링크 정리 + 의존성 검사
-# 사용: ./install.sh [--check [--probe]]
+# 사용: ./install.sh [--check [--probe] | --dry-run]
+#   --dry-run: 만들 스킬 링크만 출력한다(파일·디렉토리·심링크를 쓰지 않음, 정리·의존성 검사 생략).
 #   (repo는 ~/.agents/skills 에 clone되어 있어야 함 — codex가 이 경로를 직접 스캔)
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 LINK_TARGETS=("$HOME/.claude/skills" "$HOME/.kiro/skills" "$HOME/.gemini/skills" "$HOME/.config/opencode/skills")
+# codex scans ~/.agents/skills (this repo) directly, so top-level skills need no link there.
+# Vendored skills sit nested under third_party/, which a direct scan is not known to reach,
+# so they are also linked into codex's own skill dir.
+CODEX_VENDOR_TARGET="$HOME/.codex/skills"
+DRY_RUN=0
 
 run_scopefuel() {
   local timeout_s="$1"
@@ -138,7 +144,67 @@ prune_links() {
   done
 }
 
+# Vendored skills to link: the names in third_party/<vendor>/INSTALL (one per line, # comments),
+# resolved to third_party/<vendor>/skills/<name>. Prints "name<TAB>dir"; a name that has no
+# SKILL.md or collides with a top-level skill is reported on stderr and skipped.
+vendored_skills() {
+  local list name dir
+  for list in "$REPO_DIR"/third_party/*/INSTALL; do
+    [ -f "$list" ] || continue
+    while IFS= read -r name; do
+      case "$name" in ''|'#'*) continue ;; esac
+      dir="$(dirname "$list")/skills/$name"
+      if [ ! -f "$dir/SKILL.md" ]; then
+        echo "  ⚠️  vendored skill '$name' listed in $list has no SKILL.md — skipped" >&2
+      elif [ -f "$REPO_DIR/$name/SKILL.md" ]; then
+        echo "  ⚠️  vendored skill '$name' collides with the top-level skill — skipped" >&2
+      else
+        printf '%s\t%s\n' "$name" "$dir"
+      fi
+    done < "$list"
+  done
+}
+
+# link_skill TARGET NAME DIR: symlink DIR as TARGET/NAME (or just print it under --dry-run).
+link_skill() {
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "  would link $1/$2 -> $3"
+    return 0
+  fi
+  mkdir -p "$1"
+  ln -sfn "$3" "$1/$2"
+  echo "  $1/$2 -> $3"
+}
+
+link_skills() {
+  local target skill name vname vdir
+  for target in "${LINK_TARGETS[@]}"; do
+    for skill in "$REPO_DIR"/*/; do
+      name="$(basename "$skill")"
+      [ -f "$skill/SKILL.md" ] || continue
+      link_skill "$target" "$name" "$REPO_DIR/$name"
+    done
+    while IFS=$'\t' read -r vname vdir; do
+      [ -n "$vname" ] && link_skill "$target" "$vname" "$vdir"
+    done < <(vendored_skills)
+  done
+  for skill in "$REPO_DIR"/*/; do
+    name="$(basename "$skill")"
+    [ -f "$skill/SKILL.md" ] || continue
+    [ "$DRY_RUN" = 1 ] && echo "  codex scans ~/.agents/skills directly: $REPO_DIR/$name"
+  done
+  while IFS=$'\t' read -r vname vdir; do
+    [ -n "$vname" ] && link_skill "$CODEX_VENDOR_TARGET" "$vname" "$vdir"
+  done < <(vendored_skills)
+}
+
 if [ "${1:-}" = "--check" ]; then check_deps "$@"; exit $?; fi
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+  echo "== 심링크 생성 (dry-run: 아무것도 쓰지 않음) =="
+  link_skills
+  exit 0
+fi
 
 if [ "$REPO_DIR" != "$HOME/.agents/skills" ]; then
   echo "⚠️  이 repo는 ~/.agents/skills 에 있어야 codex가 직접 스캔한다. 현재: $REPO_DIR" >&2
@@ -152,19 +218,11 @@ for tool in "$REPO_DIR"/bin/*; do
 done
 
 echo "== 심링크 생성 =="
-for target in "${LINK_TARGETS[@]}"; do
-  mkdir -p "$target"
-  for skill in "$REPO_DIR"/*/; do
-    name="$(basename "$skill")"
-    [ -f "$skill/SKILL.md" ] || continue
-    ln -sfn "$REPO_DIR/$name" "$target/$name"
-    echo "  $target/$name -> $REPO_DIR/$name"
-  done
-done
+link_skills
 
 echo "== 끊긴 심링크 정리 =="
 prune_links "$HOME/.local/bin" bin
-for target in "${LINK_TARGETS[@]}"; do
+for target in "${LINK_TARGETS[@]}" "$CODEX_VENDOR_TARGET"; do
   prune_links "$target" skill
 done
 

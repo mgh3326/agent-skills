@@ -1,0 +1,9 @@
+# Vendored pstack skills that install.sh links into agent skill directories.
+# One name per line. Every vendored skill stays readable through the relative links
+# the installed ones follow; only these appear in the skill list of every session.
+# Context cost is why this is an allowlist: 67 descriptions in every session is not free.
+# Precedence: fleet-review/SKILL.md says the fleet brief and the wake skill override these.
+how
+architect
+blast-radius
+tdd

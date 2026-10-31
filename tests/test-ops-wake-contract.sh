@@ -125,7 +125,8 @@ REQUIRED = [
 SKILL_FORBIDDEN = re.compile(r"\b(?:" + "|".join(map(re.escape, RETIRED)) + r")\b")
 SKILL_ALLOWED = {
     # director/ keeps the Phase B gate scripts and their policy file.
-    "wake": re.compile(r"--role builder|director/gate_policy\.json"),
+    # `architect` also names a vendored pstack skill (third_party/pstack); only that exact phrase is exempt.
+    "wake": re.compile(r"--role builder|director/gate_policy\.json|vendored `how`, `architect`, `blast-radius`, `tdd`"),
     "ops": re.compile(r"--role builder|\binstaller seat\b|\*\*Installer\*\*"),
 }
 REF_FORBIDDEN = re.compile(
