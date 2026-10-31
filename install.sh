@@ -198,6 +198,33 @@ link_skills() {
   done < <(vendored_skills)
 }
 
+# Remove links to vendored skills that INSTALL no longer lists (trimming INSTALL must uninstall).
+# Only symlinks pointing into this repo's third_party/*/skills/ are touched.
+prune_unlisted_vendored() {
+  local listed target link dest name
+  listed="$(vendored_skills 2>/dev/null | cut -f1)"
+  for target in "${LINK_TARGETS[@]}" "$CODEX_VENDOR_TARGET"; do
+    [ -d "$target" ] || continue
+    for link in "$target"/*; do
+      [ -L "$link" ] || continue
+      dest="$(readlink "$link")"
+      case "$dest" in
+        "$REPO_DIR"/third_party/*/skills/*) ;;
+        *) continue ;;
+      esac
+      name="$(basename "$link")"
+      case "
+$listed
+" in
+        *"
+$name
+"*) continue ;;
+      esac
+      rm -f "$link" && echo "  pruned $link (no longer listed in INSTALL)"
+    done
+  done
+}
+
 if [ "${1:-}" = "--check" ]; then check_deps "$@"; exit $?; fi
 if [ "${1:-}" = "--dry-run" ]; then
   DRY_RUN=1
@@ -225,6 +252,7 @@ prune_links "$HOME/.local/bin" bin
 for target in "${LINK_TARGETS[@]}" "$CODEX_VENDOR_TARGET"; do
   prune_links "$target" skill
 done
+prune_unlisted_vendored
 
 check_deps || true
 echo "완료. 각 에이전트 세션은 재시작 후 스킬 목록에 반영된다 (본문은 호출 시점에 읽힘)."

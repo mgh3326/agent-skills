@@ -347,7 +347,8 @@ disposition and never blocks. Do not widen scope to answer a finding.
   `GITHUB_TOKEN=$(gh auth token) mergewake review --repo <owner>/<repo> --pr <n> --author-family <family> --apply`.
   Fix critical/high. Give every medium/low a disposition — fix, dismiss with a one-line reason,
   or defer to a follow-up hk task — then push. Never push only to quiet a finding. Do not
-  re-run the review. If the config is missing, skip the review and say so in the report.
+  re-run the review. If the config is missing, skip the review and say so in the report; a
+  skipped review never satisfies the merge gate — the repo session runs it before merging.
 - Triage by `fleet-review` (rubric, `.mergewake/triage-patterns.md`, patch-id). For nontrivial
   design read the vendored `how`, `architect`, `blast-radius`, `tdd` first. The fleet brief and
   the `wake` skill override any vendored pstack skill (`third_party/pstack/REVIEW.md`).

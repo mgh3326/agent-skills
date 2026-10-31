@@ -44,11 +44,11 @@ make_repo() {
   mkdir -p "$repo/docs"   # no SKILL.md: never linked
   # A vendored tree: two allowlisted skills (one later deleted), one skill not allowlisted.
   mkdir -p "$repo/third_party/acme/skills"
-  for s in vkeep vgone vnotlisted; do
+  for s in vkeep vgone vdelist vnotlisted; do
     mkdir -p "$repo/third_party/acme/skills/$s"
     printf -- '---\nname: %s\n---\n' "$s" >"$repo/third_party/acme/skills/$s/SKILL.md"
   done
-  printf '# comment\nvkeep\nvgone\n' >"$repo/third_party/acme/INSTALL"
+  printf '# comment\nvkeep\nvgone\nvdelist\n' >"$repo/third_party/acme/INSTALL"
   printf '#!/bin/sh\n' >"$repo/bin/tool-keep"
   printf '#!/bin/sh\n' >"$repo/bin/tool-gone"
   chmod +x "$repo/bin/"*
@@ -74,6 +74,8 @@ scenario() {
     [[ -e "$home/$t/vnotlisted" ]] && echo "$t/vnotlisted linked though not allowlisted"
   done
   rm -rf "$repo/oldskill" "$repo/bin/tool-gone" "$repo/third_party/acme/skills/vgone"
+  # vdelist stays on disk but leaves the allowlist: trimming INSTALL must uninstall it.
+  printf '# comment\nvkeep\nvgone\n' >"$repo/third_party/acme/INSTALL"
   rm "$repo/gutted/SKILL.md"
   out="$(run_install "$repo" "$home")"
   for t in "${TARGETS[@]}"; do
@@ -85,6 +87,7 @@ scenario() {
   done
   for t in "${VENDORED_TARGETS[@]}"; do
     [[ -L "$home/$t/vgone" ]] && echo "$t/vgone not pruned"
+    [[ -L "$home/$t/vdelist" ]] && echo "$t/vdelist (delisted) not pruned"
     [[ -L "$home/$t/vkeep" && -f "$home/$t/vkeep/SKILL.md" ]] || echo "$t/vkeep link lost"
   done
   [[ -L "$home/.local/bin/tool-gone" ]] && echo "bin/tool-gone not pruned"
@@ -132,5 +135,5 @@ mutant skill-md-check-removed 's|^      \[ -f "\$dest/SKILL.md" \] && continue$|
 # shellcheck disable=SC2016
 mutant bin-prune-removed 's/^prune_links "\$HOME\/.local\/bin" bin$/:/'
 # shellcheck disable=SC2016
-mutant codex-vendor-prune-removed 's/^for target in "\${LINK_TARGETS\[@\]}" "\$CODEX_VENDOR_TARGET"; do$/for target in "${LINK_TARGETS[@]}"; do/'
+mutant unlisted-prune-removed 's/^prune_unlisted_vendored$/:/'
 echo "PASS mutants assertion-red=5/5"
