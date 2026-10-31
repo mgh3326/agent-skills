@@ -1,6 +1,6 @@
 ---
 name: wake
-description: Run repo work by the wake method — one small PR per worker, one independent mergewake review, every finding fixed or replied, CI green, then the repo session merges. No tester rounds, no orchestrator in the path. Covers the repo session's loop (tier, task, worktree, brief, spawn, merge gate, merge, reap), the worker's brief contract, and a delegated PR seat spawned to run the loop for a parent lane. Use in a repo session (e.g. an integrator lane) that decides repo work with the operator directly, in every worker it spawns, and in a delegated seat. Triggers - "wake method", "run this as a wake PR", "워커 띄워", repo-session spawn of an implementation worker, a seat spawned with `--role builder`.
+description: Run repo work by the wake method — one small PR per worker, one independent mergewake review, critical/high fixed and every other finding given a disposition, CI green, then the repo session merges. No tester rounds, no orchestrator in the path. Covers the repo session's loop (tier, task, worktree, brief, spawn, merge gate, merge, reap), the worker's brief contract, and a delegated PR seat spawned to run the loop for a parent lane. Use in a repo session (e.g. an integrator lane) that decides repo work with the operator directly, in every worker it spawns, and in a delegated seat. Triggers - "wake method", "run this as a wake PR", "워커 띄워", repo-session spawn of an implementation worker, a seat spawned with `--role builder`.
 ---
 
 # wake — repo-session PR loop
@@ -157,8 +157,10 @@ All must hold for head `$H`:
   `gh pr checks <n> --repo <owner>/<repo> --json name,bucket --jq '.[]|select(.name=="<check>")|.bucket'`
   prints `pass`. `pending`, or nothing while other checks still run (an aggregate check
   appears late) → wait. `fail`, or still absent after every check finished → BLOCKED.
-- No unresolved critical/high finding. Every review thread is fixed or replied to; list
-  unresolved threads across all pages with
+- No unresolved critical/high finding. A resolved finding stays resolved, and a critical/high
+  closed by a dismissal with evidence is the desk's call to accept, not a reason for a new
+  head. Every review thread is fixed, dismissed with a reason, or deferred to a task, and
+  replied to; medium/low never block on their own. List unresolved threads across all pages with
   ```sh
   gh api graphql --paginate -F o=<owner> -F r=<repo> -F n=<n> -f query='query($o:String!,$r:String!,$n:Int!,$endCursor:String){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{isResolved path comments(first:1){nodes{body}}}}}}}' \
     --jq '.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved|not)'
@@ -255,6 +257,9 @@ refuses `--owner`).
 - **Every instruction maps 1:1 to an observable acceptance check** (`<command>` → expected
   output). Re-read the brief backwards: an instruction without a check is either given one
   or deleted. Small tasks need this most — nobody re-reads them.
+- **The acceptance list is a closed contract.** It is what the reviewer judges; the brief says
+  findings outside it are advisory, and the worker copies it into the PR body. Anything the
+  brief author wants checked goes in it before spawn, not into a later review round.
 - **List what to try and the floor**, never "verify it yourself": the tests to run, and
   "claim an absence only after an exhaustive search".
 - **Report outside the worktree:** `~/work/herdr-inbox/jobs/<job>/report.md`, and say in the
@@ -324,8 +329,11 @@ Environment: <test DB | dry-run | production (operator present)>
 ## Do
 <numbered instructions>
 
-## Acceptance (1:1 with Do)
-<numbered observable checks: command → expected output>
+## Acceptance (closed contract)
+<numbered observable checks, 1:1 with Do: command → expected output>
+This section is the whole contract. Copy it verbatim into the PR body under the same
+heading — reviewers receive the PR body. A finding outside it is advisory: it gets a
+disposition and never blocks. Do not widen scope to answer a finding.
 
 ## Rules
 - Small PR. No direct merge. Run only the tests for what you changed; full suites belong to CI.
@@ -334,10 +342,17 @@ Environment: <test DB | dry-run | production (operator present)>
   Mergewake-Author-Family: <anthropic|openai|google|…>
   Mergewake-Author-Profile: <launch profile>
   Mergewake-Task: <id>
-- Review once: after opening the PR run exactly once
+- Review once: if `~/.config/mergewake/config.yaml` exists on this host, after opening the PR
+  run exactly once
   `GITHUB_TOKEN=$(gh auth token) mergewake review --repo <owner>/<repo> --pr <n> --author-family <family> --apply`.
-  Fix or reply to every finding, then push. Do not re-run the review.
-- Do not wait for CI. Done = pushed + one review + every finding handled + report + one READY.
+  Fix critical/high. Give every medium/low a disposition — fix, dismiss with a one-line reason,
+  or defer to a follow-up hk task — then push. Never push only to quiet a finding. Do not
+  re-run the review. If the config is missing, skip the review and say so in the report; a
+  skipped review never satisfies the merge gate — the repo session runs it before merging.
+- Triage by `fleet-review` (rubric, `.mergewake/triage-patterns.md`, patch-id). For nontrivial
+  design read the vendored `how`, `architect`, `blast-radius`, `tdd` first. The fleet brief and
+  the `wake` skill override any vendored pstack skill (`third_party/pstack/REVIEW.md`).
+- Do not wait for CI. Done = pushed + review handled (or skipped, said so) + report + one READY.
 - Never read, print or copy env, token or credential files, never print env vars, and never read
   real agent dotfiles (`~/.codex`, `~/.claude`, `~/.claude.json`).
 - No Postgres, production DB or broker API, and never pass an env-file path to anything.
@@ -356,6 +371,6 @@ Environment: <test DB | dry-run | production (operator present)>
 ## Done
 Write ~/work/herdr-inbox/jobs/<job>/report.md — outside the worktree, so it does not affect
 `git status`; do not delete it: PR URL, head SHA (`git ls-remote`), tests run with output,
-each finding and how it was handled. Then emit exactly once:
+each finding and its disposition (fix, dismiss, defer). Then emit exactly once:
 panewire emit --kind lane.event --lane <parent-lane> --type ready --event-id <job>-ready --text '[<job>] READY | <pr> | ~/work/herdr-inbox/jobs/<job>/report.md'
 ````

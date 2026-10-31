@@ -1,0 +1,24 @@
+source: https://github.com/michael-denyer/pstack-claude
+commit: 5851c89613e2ddc3a6b7f4af02a42363b30ef8d3
+subtree: plugins/pstack/skills/ (Claude Code build; derived from https://github.com/cursor/plugins/tree/main/pstack)
+license: MIT (LICENSE, LICENSE-cursor-team-kit, LICENSE-thermos; provenance in NOTICE.md and NOTICE-skills.md)
+vendored: 2026-10-31
+method: file copy, not a symlink or submodule. Bump = re-copy at a new commit, review the diff like code, update this file and REVIEW.md in the same PR. Never auto-update.
+
+# Excluded (not vendored; list is exhaustive)
+
+Executables and tool sources, because the fleet installs no third-party executables:
+- skills/poteto-mode/scripts/        bun/TypeScript tools (watch-pr, ship-pr, orch, bootstrap.ts, resume.mjs, check-plan.mjs, check-playbooks.mjs, worktree-audit.mjs, codex-session-effort.mjs) and their lockfiles
+- skills/statechart/scripts/         bun/TypeScript statechart compiler, its `statechart` launcher, TLA+/dot/mermaid test corpus
+- skills/setup-pstack/scripts/       shell and awk (check-sheet.sh, read-sheet.sh, sheet.awk, check-sheet.awk)
+- skills/reflect/scripts/            node scripts (find-transcript.mjs, claude-project-dir.mjs)
+- skills/show-me-your-work/scripts/  shell (log.sh)
+Skills that name those scripts (poteto-mode, statechart, setup-pstack, reflect, show-me-your-work, recall, automate-me) still carry the references; the scripts are absent, so those steps cannot run here.
+
+Everything else in the source repo, because it is not a skill:
+- plugins/pstack/hooks/              SessionStart routing hook, pre-tool-use hook (shell/awk/ps1)
+- plugins/pstack/agents/             subagent definitions (poteto-agent, comment-sicko, thermo-nuclear-*)
+- plugins/pstack/pi/, models.json, .codex-plugin/, .muse-plugin/, .claude-plugin/, assets/
+- tools/, tests/, tla/, lean/, .github/, package.json, bun.lock, bunfig.toml, CHANGES.md, CONTRIBUTING.md, docs/, plugin READMEs
+
+Files kept although not Markdown: LICENSE files under skills/poteto-mode/references/licenses/ and skills/show-me-your-work/references/decision-log-template.tsv (a data template).
