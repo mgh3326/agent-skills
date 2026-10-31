@@ -9,7 +9,6 @@
 | 완료·ESC 기록 | `runtug done <job> [--report P]` · `runtug escalate <job> --question '<text>'` |
 | 풀린 잡을 기존 pane 에 되묶기 | `runtug restore <job>` |
 | 회수 | `runtug reap` · `runtug prune` (`reap.md`) |
-| 무거운 실행 | `runtug heavy -- <cmd>` (`heavy.md`) |
 | 레인 감사 | `runtug lanes-missing` |
 | 대상 찾기·이름 복구 | `runtug find <이름\|라벨> [--pane-only]` · `runtug name-sync [--apply]` |
 | 호스트·프로필 | `runtug hosts` · `runtug profiles` (`spawn-hosts.md`) |

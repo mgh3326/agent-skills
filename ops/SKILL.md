@@ -41,7 +41,6 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
 |---|---|---|
 | Spawn a worker or consult pane | [`spawn.md`](references/spawn.md) | `runtug spawn` flags, auto model selection, `--task` binding, `--owner`, landing check §4-2 |
 | Place on another host, wake a sleeping one | [`spawn-hosts.md`](references/spawn-hosts.md) | `--host auto` placement, `--tags`, SSH hosts, lane registration |
-| Run something over a minute | [`heavy.md`](references/heavy.md) | `runtug heavy -- <cmd>`, one per host slot |
 | Hand work or a decision to another session | [`relay.md`](references/relay.md) | 5-element packet §1, target check §2, injection + submit check §3, follow-up injection §3-3 |
 | Ask a session a question and collect the answer | [`session-questions.md`](references/session-questions.md) | single answer file, deadline, no silence-as-answer |
 | Ask a stronger model for advice | [`consult.md`](references/consult.md) | other provider family, self-contained packet, pane by default |
