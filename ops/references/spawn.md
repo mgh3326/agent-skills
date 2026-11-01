@@ -48,8 +48,8 @@ mergewake reap 이 한다.
   보이고 pane·lease·claim 을 만들지 않는다. 모르는 인자는 무시되지 않고 rc 2 다. 수동 기동은
   `herdr agent start <유일이름> --workspace <ws> --cwd <worktree> --no-focus -- <argv>`.
 - **모델은 runtug 가 고른다**(`-m auto` 또는 생략): 쿼타 카탈로그 rung 을 task 의 grade·role·
-  `--tags` 로 거르고, pool-order 정책(free → WASTE 구독 → credit → ranked; urgent 는 free 가 맨 뒤,
-  urgency 는 `--urgency` 또는 hk priority 1–2)으로 줄 세운 뒤 presence 와 quota gate 를 통과한 첫
+  `--tags` 로 거르고, hk `policy/quota-stop` 의 풀 순서(urgency 는 `--urgency` 또는 hk priority
+  1–2)로 줄 세운 뒤 presence 와 quota gate 를 통과한 첫
   후보를 쓴다. unknown·stale 증거는 탈락이다(fail closed). 명시 `-m <프로필>`·`--host <이름|local>`
   은 `--override-reason '<사유>'` 가 필수이고 기록되며, quota gate 는 그대로 적용된다.
   escalation·consult_only rung 은 `--allow-escalation` 없이 자동 후보가 아니다. 추천 목록에서

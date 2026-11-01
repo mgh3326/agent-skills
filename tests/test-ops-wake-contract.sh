@@ -65,7 +65,12 @@ REQUIRED = [
     ("wake", "### T3 split — by invariant impact, not by file type", "ambiguous", r"Ambiguous → `NEEDS_CLASSIFICATION`\*\*, not a lower-T run"),
     ("wake", "### T3 split — by invariant impact, not by file type", "reclassify", r"A peripheral PR that touches core is reclassified T3\."),
     # Subagents.
-    ("wake", "## Subagent vs worker", "t2-worker", r"\*\*T2 and above always\*\*"),
+    ("wake", "## Subagent vs worker", "subagent-rule-home", r"`robin-mode` \(rstack\)\s+§Subagents versus spawned workers"),
+    # READY contract (operator 2026-11-01, hk task 2485).
+    ("wake", "## READY", "ready-keeps-author", r"\*\*the author stays the PR owner until merge, an explicit hand-off, or abandonment\*\*"),
+    ("wake", "### Preservation evidence (refactors)", "preservation-template", r"\| Existing invariant \| Production entry point \| Executed evidence \|"),
+    ("wake", "## BLOCKED", "no-fix-worker-while-alive", r"Do not spawn a fix worker while that attempt is alive"),
+    ("wake", "## Rules", "brief-preservation-ref", r"preservation table \(`wake`\s+§READY, Preservation evidence\)"),
     # Merge gate additions.
     ("wake", "## Merge gate", "reviewer-family", r"mergewake picks the reviewer from `--author-family` and records `same_family` on each pass"),
     ("wake", "## Merge gate", "base-freshness", r"\*\*Base freshness:\*\* `git merge-base --is-ancestor origin/<base> \"\$H\"`"),
