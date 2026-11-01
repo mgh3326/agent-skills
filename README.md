@@ -32,8 +32,8 @@ mutation 등)의 구체 사례에서 뽑아 도메인 무관 형태로 추상화
 
 | 스킬 | 용도 |
 |---|---|
-| `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → mergewake review 1회 → 지적 처리 → CI green → repo 세션 머지. tester 라운드 없음, 워커 브리프 템플릿 포함 |
-| `fleet-review` | 리뷰 지적 처리 — fix/dismiss/defer 기준표, repo별 학습 skip 패턴(`.mergewake/triage-patterns.md`), "판정은 SHA가 아니라 패치를 덮는다"(patch-id), poteto-mode 3원칙(목표 재진술·데이터 모양·실물 증명), 벤더링한 pstack보다 fleet 브리프·`wake`가 우선한다는 선언 |
+| `wake` | repo 세션의 PR 루프(wake method) — 티어·T3 분할·브리프 규칙·머지 게이트·위임 PR 좌석까지 자족. 작은 PR → 독립 mergewake review → 지적 처리(수정 후엔 delta 만) → CI green → repo 세션 머지. READY 계약(저자 소유 유지·refactor 보존 증거 표), tester 라운드 없음, 워커 브리프 템플릿 포함 |
+| `fleet-review` | 리뷰 지적 처리 — fix/dismiss/defer 기준표, repo별 학습 skip 패턴(`.mergewake/triage-patterns.md`), 판정 범위(닫힌 계약 + 이 변경이 만든 회귀), 수정 후 라운드, 리뷰 독립성(same-family 는 참고용), "판정은 SHA가 아니라 패치를 덮는다"(patch-id). 작성자 방법(opener)과 pstack 어댑터는 rstack `robin-mode` |
 | `ops` | 레인 기계학 — 스폰·착지 확인, 릴레이·주입(5요소·`comms-contract: v1`), 자문, 결정 요청, 결정 ESC(pane 질문 금지), 폴링 없는 대기, 회수, 배포 1건(installer 좌석, operator-desk 직속). `SKILL.md`는 라우팅 표, 절차는 `ops/references/` |
 
 스킬 간 관계: `wake`는 무엇을 언제 끝낼지(티어·브리프·머지 게이트)를, `ops`는 그 과정의 기계학을 담당한다.

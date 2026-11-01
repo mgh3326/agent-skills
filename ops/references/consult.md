@@ -4,8 +4,8 @@
 🔴 **자문 패킷 머리에 이 줄을 그대로 옮겨 적는다.** 자문가는 이 판을 보고 완료 통지 방식을 정한다.
 
 **원칙 1: 자문자는 이 대화의 컨텍스트가 없다** — 질문 패킷은 자족적이어야 한다.
-**원칙 2: 자문은 참고 의견이다** — 승인이 아니다. "자문이 하라고 했다"는 mutation·머지·
-배포의 실행 근거가 될 수 없다. 채택 여부는 질의 세션의 계약과 운영자 승인 범위를 따른다.
+**원칙 2: 자문 답변의 효력은 `wake` §Authority 가 정한다** — 채택 여부는 질의 세션의 계약과
+운영자 승인 범위를 따른다.
 **원칙 3: 자문 맥락은 추적 가능해야 한다** — pane 세션 스폰이 기본(운영자가 사후에 어떤
 질문·답이 오갔는지 herdr에서 확인 가능 + 같은 세션에 후속 재질의 가능). headless 1회성은
 간단한 단답 확인용 예외.
@@ -16,24 +16,16 @@
   (근거: 2026-09-14 실사고 — 6건 전량 드롭, 부분 배달 0).
 - **세션 이름 지정 시**: `runtug find <이름>`으로 상존·화면 확인 → 있으면 **`relay.md`의 질의
   절차**로 질의. 없으면 아래 경로로.
-- **프로필 지정(기본)**: runtug 자동 선택은 tester·reviewer 에서만 부모 계열을 빼고, 자문
-  (`--role counsel`)에서는 빼지 않는다. 그래서 자문 프로필은 질문자와 다른 계열에서 `-m <프로필>
-  --override-reason '<사유>'` 로 명시한다 — 이름은 `runtug profiles`, 쿼타는 `pacelever --json`
-  으로 본다(모델명을 이 문서에 적지 말 것 — 정본은 쿼타 카탈로그).
-- 🔴 **자문자는 질문자와 다른 계열이어야 한다.** 자문의 가치는 **높이가 아니라 독립성**에서
-  온다. 같은 계열·같은 모델에 물으면 대체로 자기 자신과 동의한다 — `wake` 의 "같은 세션
-  자체검증은 무효"와 같은 논리다. 예: 질문자가 `codex-sol ultra`면 자문은 Anthropic 계열
-  (`kiro-opus`)로. 계열이 겹치는 후보밖에 없으면 **한 급 아래라도 다른 계열**을 택한다.
-- **`fable`과 `astra`는 급표 밖 운영자 명시(operator-explicit) 자문 전용 프로필이다(ROB-591)**
-  — 자동 선택 후보가 아니다. 자문 목적의 명시 스폰(`-m fable`, `-m codex-astra`)은 계속
-  허용된다(자문 목적 fable pane 스폰은 07-29 운영자 승인). 필요·근거는 자문 패킷 자체에
-  적는다 — 급표의 gate_reason 문구에 기대지 않는다.
-- **`fable` 스폰에는 운영자 명시 요청 참조가 필수다(task #625)** — `policy launch` 와
-  quota gate 둘 다 같은 키를 요구한다:
-  `runtug spawn -m fable ... --operator-request hk:doc/<승인-문서-키>` (또는 `hk:task/<정수>`).
-  요청 없는 fable 스폰은 gate 가 `consult_only` 로 거부한다. `astra` 는 다르다 — 요청이
-  아니라 pacelever gate 가 받는 `--purpose architect|operator-request` 가 자격이다(astra 에 요청을
-  붙이면 gate 가 `operator_request_not_applicable` 로 거부한다).
+- **프로필·계열·effort 는 hk `policy/model-routing` 이 정한다** — 이 문서에 모델명이나 자격표를
+  적지 않는다. 고르는 방법:
+  `runtug resolve --role consult --builder-family <질문자 계열>` 의 마지막 줄 `profile=<이름>
+  effort=<rung>` 을 스폰의 `-m`·`--effort` 로 쓴다. resolve 가 거부하거나 고른 프로필이 질문자와
+  같은 계열이면 다른 프로필을 직접 고르지 말고 부모 레인에 결정을 올린다(`ops` §Escalate a
+  decision).
+- 운영자 명시 전용 프로필은 gate 가 거부 사유로 필요한 인자를 알려준다: `consult_only` →
+  `--operator-request hk:doc/<승인-문서-키>`(또는 `hk:task/<정수>`), `--purpose` 를 요구하면 그
+  값을 준다(`operator_request_not_applicable` 이면 요청 참조를 빼고 `--purpose` 를 쓴다). 필요·근거는
+  자문 패킷 자체에 적는다.
 
 ## 2. 질문 패킷 (자족성 체크리스트)
 
@@ -58,16 +50,13 @@ herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>
 ```bash
 # 이름: consult-<주제> (전역 유일). cwd = 질의 대상 자료가 있는 repo/디렉토리
 runtug spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --t <task 의 T> \
-  --role counsel --keep --override-reason '<사유: 질문자와 다른 계열>' \
-  [--parent-job <내 잡>] --report ~/work/herdr-inbox/jobs/consult-<주제>/answer.md [--effort <레벨>]
+  --role counsel --routing-role consult --keep --override-reason '<사유: runtug resolve 결과>' \
+  [--parent-job <내 잡>] --report ~/work/herdr-inbox/jobs/consult-<주제>/answer.md --effort <resolve 의 rung>
 ```
 - 자문도 task 에 묶인다(`spawn.md` §무인 실행·task 기록). 잡 안의 pane 이면 `ARBITER_JOB` 으로
   부모 잡을 상속하고, 아니면 `--parent-job <관련 잡>` 을 주거나 자문용 hk task(제목에
   `(grade <G>, T0)`)를 만들어 `--task` 로 준다. `--t` 는 묶인 task 표식의 T 와 같아야 한다.
 - `--report` 는 자문 잡(또는 부모 잡) 디렉터리 안이어야 하므로 답변 파일도 그 경로로 지정한다.
-- codex-astra 자문의 `--effort` 기본값은 **xhigh** 다(다른 프로필은 각자의 기본값을 쓴다) — runtug
-  는 codex-astra 의 effort 를 고정하지 않으므로 스폰에 `--effort xhigh` 를 명시한다
-  (task #527 요건 ⑦). **max 는 운영자가 명시할 때만** 쓴다.
 - `--keep` 은 보호 표시다(#603): 자문 세션은 답변 뒤에도 후속 질의를 받으므로 `runtug reap` 이
   후보로 올리지 않고, mergewake reap 도 `consult-*` 이름을 닫지 않는다. 다 쓴 자문 pane 은
   요청자가 직접 닫는다.
@@ -95,13 +84,12 @@ runtug spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-
 - #252 가 수리되면 이 예외를 삭제한다. 예외 삭제 조건은 `relay.md` §3-1 정본을 따른다.
 - 자문 세션은 답변 후 **바로 정리하지 않는다** — 운영자 맥락 검토·후속 재질의용으로 유지,
   정리는 운영자 몫(자문 pane은 회수 후 종료).
-- 자문 난도가 높으면 **2계열 교차 자문**(예: opus + sol)으로 판정 일치 여부까지 확인 —
+- 자문 난도가 높으면 **2계열 교차 자문**(서로 다른 계열 두 곳)으로 판정 일치 여부까지 확인 —
   불일치면 그 자체가 "운영자 표면화" 신호다.
 - **상존 세션 질의가 나은 경우**: 그 세션의 컨텍스트가 자산일 때(예: repo 세션의 전황, 분석을
   직접 쓴 세션). 이때는 스폰 없이 `relay.md`의 질의 절차로.
-- (예외) 단답 확인·형식 검증처럼 맥락 보존 가치가 없는 질문만 headless 1회성 허용:
-  `claude -p --model opus` / `codex exec -c model_reasoning_effort=xhigh` /
-  `kiro-cli chat --no-interactive --trust-tools=` / `agy -p --add-dir <repo>`.
+- (예외) 단답 확인·형식 검증처럼 맥락 보존 가치가 없는 질문만 headless 1회성 허용 — 모델과
+  effort 는 같은 `runtug resolve --role consult` 결과를 그 하네스의 비대화형 실행에 넘긴다.
 
 ## 4. 회수·기록·채택
 
@@ -113,7 +101,7 @@ runtug spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-
 
 ## 설계 배경
 
-- 기존 "Fable 자문 프로토콜"(세션→inbox→Fable 답변)의 일반화 — 자문처를 이름이 아닌
+- 기존 "단일 모델 지정 자문 프로토콜"(세션→inbox→지정 모델 답변)의 일반화 — 자문처를 이름이 아닌
   **능력(티어)**으로 지정해 세션 생멸과 무관하게 동작한다.
 - pane 스폰이 기본인 이유(07-29 운영자 결정): headless는 싸지만 자문 맥락이 어디에도 안
   남는다 — 운영자가 "무슨 근거로 그 판단이 나왔나"를 사후 추적하려면 pane 세션이 필요하고,

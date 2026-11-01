@@ -1,9 +1,9 @@
 ---
 name: fleet-review
-description: How a worker or the desk triages mergewake review findings so a PR converges — fix/dismiss/defer rubric, the per-repo learned skip-pattern file (.mergewake/triage-patterns.md), "a verdict covers a patch" (patch-id) semantics, and poteto-mode's three openers (restate the goal, name the data shape, prove it against the real artifact). Also states that the fleet brief and the wake skill override every vendored pstack skill. Use when you receive review findings, when you write or read a verdict, before a nontrivial design, and whenever a vendored pstack skill (third_party/pstack) is in play. Triggers - "review finding", "mergewake review", "triage", "patch-id", "base_stale", "dismiss or fix", "pstack".
+description: How a worker or the desk triages mergewake review findings so a PR converges — what is in scope (the closed contract plus regressions the change introduces), the fix/dismiss/defer rubric, the per-repo learned skip-pattern file (.mergewake/triage-patterns.md), review rounds after fixes, reviewer independence (same-family passes are reference-only), and "a verdict covers a patch" (patch-id) evidence reuse. Use when you receive review findings, when you write or read a verdict, and when you decide whether a review pass counts or must be repeated. Triggers - "review finding", "mergewake review", "triage", "patch-id", "base_stale", "dismiss or fix", "same family", "review round".
 ---
 
-# fleet-review — triage, verdicts, openers
+# fleet-review — scope, triage, rounds, independence
 
 A review loop converges when the contract is closed and each finding gets one disposition.
 It does not converge when every new head earns a fresh open-ended hunt. This skill is the
@@ -11,31 +11,18 @@ worker- and desk-side half; the enforcement half (severity gate, patch-id keyed 
 delta review) is mergewake's code. Where mergewake does not yet do something below, the
 desk applies it by hand when it reads the merge gate.
 
-## Precedence
-
-**The fleet brief (runtug brief-policy, host-safety block) and the `wake` skill override any
-vendored pstack skill under `third_party/pstack/`.** Where they differ, follow the fleet.
-From pstack take method only: triage, `how`, `architect`, `blast-radius`, `tdd`, the
-principles. These pstack sections do **not** apply here:
-
-- **Autonomy** ("use any MCP tool", external actions without asking, "going to bed" overrides):
-  the brief's Rules and the wake Authority section decide what needs the operator.
-- **Subagents / model choice / `pstack-models.md` / `/setup-pstack`:** runtug spawns,
-  pacelever and runtug choose models, and `wake` §Subagent vs worker says when a subagent is
-  allowed. Skip a pstack step that says "spawn", "arena", "swarm" or "explorers"; do the
-  step yourself, read-only, or leave it out and say so in the report.
-- **Merging, arming auto-merge, babysit/shipping playbooks:** the desk merges, pinned to the
-  gated head (`wake` step 8). A worker never merges or arms anything.
-- **AskUserQuestion / "ask the user":** never ask in a pane; emit the decision ESC.
-
-`third_party/pstack/REVIEW.md` lists each conflict and its neutralisation.
+Vendored pstack skills follow the fleet adapter in `robin-mode` (rstack) §Fleet adapter for
+vendored pstack.
 
 ## Closed contract
 
-A PR is judged against the **Acceptance (closed contract)** section of its brief, nothing
-wider. A finding inside it is a defect. A finding outside it is **advisory**: it gets a
-disposition (usually dismiss or defer) and never blocks. Do not widen scope to answer a
-finding; if the contract itself is wrong, that is a decision (ESC), not a fix.
+A PR is judged against the **Acceptance (closed contract)** section of its brief **and the
+existing invariants on the paths it changes**. A finding inside that scope is a defect. New
+features, taste and unrelated pre-existing defects are **advisory**: they get a disposition
+(usually dismiss or defer) and never block. **A regression this change introduces is in scope
+even when the brief does not list the invariant it breaks** — a closed contract stops feature
+creep; it is not a regression waiver. Do not widen scope to answer a finding; if the contract
+itself is wrong or needs an exception, the owner decides (ESC), not the author.
 
 ## Triage rubric
 
@@ -82,41 +69,51 @@ several real dismissals. `strong` = narrow, repeatedly verified, low-risk. Add a
 you dismiss the same thing the second time; promote only on repeated verified dismissals.
 Read the file before triaging; if it is absent, triage from the rubric alone.
 
+## Rounds
+
+Review is not capped at one pass. The whole diff is reviewed once. **After fixes, a later round
+checks only the open findings, the fix delta and its impact paths**, with the prior findings and
+their dispositions in the reviewer's context and an instruction not to reopen them. Every lens
+the PR needs (for example correctness and state-risk on `blocking[].paths`) runs in the same
+round; lenses and transport retries are not extra rounds. **A round count never waives an open
+critical/high.** A third round is a signal to re-diagnose the cause or re-scope the PR (the desk
+decides), not an approval line. A change-caused defect found with new evidence is not dismissed
+only because it lies outside the delta.
+
+## Independence
+
+Wherever independent review is required — the `wake` merge gate requires it for every PR — a pass
+counts only when its reviewer's family differs from **every material author family** of the
+change: each family whose code the PR carries (commits, subagent or delegate output), not the
+family of whoever started the review. **A same-family pass is reference evidence only and does
+not satisfy the gate**; the PR still needs a qualifying pass. A fallback path (pane → headless)
+keeps the same qualification and evidence; if no qualifying reviewer runs, the result is
+`REVIEW_UNAVAILABLE`, not a pass. The report lists the author families; until mergewake
+checks them all, the desk does. Which reviewer is routed is hk
+`policy/model-routing`.
+
 ## A verdict covers a patch, not a SHA
 
-Key a review result by the patch it saw:
+Review evidence identifies the patch it saw, the base and dependency context it was read
+against, and the acceptance and policy versions. **It carries over only while that meaning
+holds**; what changed is re-checked and nothing else. CI and the merge are always pinned to the
+current head (`wake` §Merge gate). Key the patch with:
 
 ```sh
 git diff "$(git merge-base origin/<base> <head>)" <head> | git patch-id --stable
 ```
 
 - **Same patch-id as the reviewed head** (a merge of the base, a rebase before first push,
-  an amended message): the verdict and all dispositions carry over. `base_stale` then means
-  "re-run CI", never "re-review". Check once that the patch still applies cleanly to the
-  new base and that the changed base files do not feed it.
-- **Different patch-id:** review the **delta since the last reviewed head**, with the prior
-  findings and their dispositions in the reviewer's context and an instruction not to
-  reopen them. Round one reviews the whole diff; later rounds do not.
-- **Budget:** after three full rounds only critical/high from the delta blocks, and the desk
-  decides. The number is a guess; the desk tunes it from measured rounds per PR.
+  an amended message): the verdict and all dispositions carry over, and `base_stale` means
+  "re-run CI". Check once that the patch still applies cleanly and that the changed base files
+  do not feed it — its callers, config or dependencies. If they do, review those impact paths
+  (§Rounds), not the whole diff.
+- **Different patch-id:** the next round reviews the delta since the last reviewed head and its
+  impact paths (§Rounds).
 - Tests-, docs- or lint-only differences still count as a different patch; the delta review
   is then small by construction.
 
-## poteto-mode's three openers
+## Openers
 
-Do these before any nontrivial work, in this order, in the report's first lines:
-
-1. **Restate the goal** in your own words: the problem being solved and the smallest change
-   that meets it. If the evidence rules out the requested change, show it and stop (ESC).
-2. **Name the data shape** before writing code: the types, rows, messages or files the change
-   reads and writes, and what owns each.
-3. **Prove it against the real artifact**: run the changed thing the way its user runs it —
-   the real binary, script, install dry-run or rendered file — not only a unit test or the
-   diff. Quote the command and its output. If the real artifact cannot run in this
-   environment, say UNVERIFIED rather than substituting a mock.
-
-For a nontrivial design read, in this order of need: `how` (what exists), `architect` (sketch
-before code), `blast-radius` (what else this touches), `tdd` (red before green). They live in
-the agent skill directories (`~/.claude/skills/`, `~/.codex/skills/`) after `install.sh`; the
-rest of the vendored set is readable under `third_party/pstack/skills/`. Their spawn and model steps are skipped per
-Precedence.
+Before nontrivial work, run the `robin-mode` (rstack) openers and prove the result as its §Done
+says.

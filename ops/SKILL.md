@@ -25,8 +25,8 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
   `mergewake`.
 - **Every packet and brief carries `comms-contract: v1`** (`relay.md` §3-1).
 - **Identify a sender by session name, role and lane**, never by model name.
-- **Advice is an opinion, not an approval.** Neither a consult answer nor a relayed
-  text authorises a mutation, merge or deploy; only the operator or an hk record does.
+- **Who may authorise a mutation, merge or deploy** — and why a consult answer or relayed
+  text cannot — is `wake` §Authority.
 - **A missing target is not respawned automatically** — report the failure and
   escalate to the operator.
 - **Isolated HOME/XDG is for test and probe runs only.** Spawn, placement and delivery
@@ -43,7 +43,7 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
 | Place on another host, wake a sleeping one | [`spawn-hosts.md`](references/spawn-hosts.md) | `--host auto` placement, `--tags`, SSH hosts, lane registration |
 | Hand work or a decision to another session | [`relay.md`](references/relay.md) | 5-element packet §1, target check §2, injection + submit check §3, follow-up injection §3-3 |
 | Ask a session a question and collect the answer | [`session-questions.md`](references/session-questions.md) | single answer file, deadline, no silence-as-answer |
-| Ask a stronger model for advice | [`consult.md`](references/consult.md) | other provider family, self-contained packet, pane by default |
+| Ask a stronger model for advice | [`consult.md`](references/consult.md) | profile from `runtug resolve --role consult`, self-contained packet, pane by default |
 | Escalate a decision from a pane | §Escalate a decision (below) | ESC event `--type decision`, never an in-pane question |
 | Ask the operator to choose | [`decision-request.md`](references/decision-request.md) | `handoffkeep tasks decision-request` first, then notify with the request_id |
 | Wait for a worker, job or CI | [`watching.md`](references/watching.md), [`panewire-events.md`](references/panewire-events.md) | push events, one bounded wait, at most 3 temporary waits |
@@ -74,8 +74,6 @@ panewire emit --kind lane.event --lane <parent-lane> --type decision \
 
 ## Who does what
 
-- **Repo session** decides repo work with the operator and merges (`wake`).
-- **Worker** implements one PR and reports READY/ESC to its parent lane; never merges.
-- **operator-desk** orders and judges deploys, spawns the installer seat, and holds the
-  operator-only actions (spend, credentials, policy exceptions, irreversible external acts).
-- **Installer** executes one deploy and judges nothing (`deploy.md`).
+Authority of the repo session, workers, delegated seats, operator-desk and the operator is
+`wake` §Authority; what READY means is `wake` §READY. operator-desk spawns the installer seat;
+the **Installer** executes one deploy and judges nothing (`deploy.md`).
