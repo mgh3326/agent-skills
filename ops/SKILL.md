@@ -25,8 +25,8 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
   `mergewake`.
 - **Every packet and brief carries `comms-contract: v1`** (`relay.md` §3-1).
 - **Identify a sender by session name, role and lane**, never by model name.
-- **Advice is an opinion, not an approval.** What may authorise a mutation, merge or deploy
-  is `wake` §Authority.
+- **Who may authorise a mutation, merge or deploy** — and why a consult answer or relayed
+  text cannot — is `wake` §Authority.
 - **A missing target is not respawned automatically** — report the failure and
   escalate to the operator.
 - **Isolated HOME/XDG is for test and probe runs only.** Spawn, placement and delivery
