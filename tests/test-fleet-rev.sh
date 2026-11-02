@@ -7,6 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FLEET_REV="${FLEET_REV_BIN:-$ROOT/bin/fleet-rev}"
+python3 "$ROOT/tests/test-fleet-rev-config.py"
 FIX="$ROOT/tests/fixtures/fleet-rev"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -14,6 +15,7 @@ trap 'rm -rf "$TMP"' EXIT
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 
+unset WRK_HOSTS_CONFIG
 export FLEET_HOSTS_CONFIG="$TMP/hosts.toml"
 export FLEET_REV_SSH="$FIX/fake-ssh"
 export FLEET_REV_GH="$FIX/fake-gh"
@@ -572,7 +574,7 @@ bad="$(grep -oE '>[0-9A-Za-z&/_.-]*' "$TMP/probe.sh" | grep -vE '^>(/dev/null|&[
 bad="$(grep -inE 'token|secret|\.env|id_rsa|netrc|\.aws|password|credential' "$TMP/probe.sh" || true)"
 [[ -z "$bad" ]] || fail "AC9 probe secret read: $bad"
 envnames="$(grep -oE 'environ\.get\("[A-Z_]+"|environ\["[A-Z_]+"\]' "$ROOT/bin/fleet-rev" | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u | tr '\n' ' ')"
-[[ "$envnames" == "FLEET_HOSTS_CONFIG FLEET_REV_GH FLEET_REV_SSH XDG_CONFIG_HOME " ]] ||
+[[ "$envnames" == "FLEET_HOSTS_CONFIG FLEET_REV_GH FLEET_REV_SSH WRK_HOSTS_CONFIG XDG_CONFIG_HOME " ]] ||
   fail "AC9 env reads: $envnames"
 
 # B1: the probe must not write .git/index — git's opportunistic index refresh
@@ -781,6 +783,37 @@ set -e
   fail "canonical default config did not probe its host: $OUT"
 rm "$LOCAL_HOME/.config/fleet/hosts.toml"
 pass "canonical fleet config default selects the configured probe host"
+
+# Legacy-only configuration must never silently become a local-only audit.
+for legacy_mode in env file; do
+  mkdir -p "$LOCAL_HOME/.config/wrk"
+  legacy_path="$LOCAL_HOME/.config/wrk/hosts.toml"
+  if [[ "$legacy_mode" == file ]]; then
+    printf '[hosts.a]\nssh = "x"\n' >"$legacy_path"
+  fi
+  set +e
+  if [[ "$legacy_mode" == env ]]; then
+    OUT="$(HOME="$LOCAL_HOME" WRK_HOSTS_CONFIG="$TMP/legacy-missing.toml" \
+      env -u FLEET_HOSTS_CONFIG -u XDG_CONFIG_HOME "$FLEET_REV" --only local 2>"$TMP/err")"
+  else
+    OUT="$(HOME="$LOCAL_HOME" env -u FLEET_HOSTS_CONFIG -u XDG_CONFIG_HOME \
+      "$FLEET_REV" --only local 2>"$TMP/err")"
+  fi
+  RC=$?
+  set -e
+  [[ $RC -eq 2 && -z "$OUT" ]] || fail "legacy $legacy_mode silently probed: rc=$RC $OUT"
+  [[ "$(cat "$TMP/err")" == *FLEET_HOSTS_CONFIG* ]] || fail "legacy config refusal lacks fix"
+  rm -f "$legacy_path"
+done
+# A configured canonical file wins even if obsolete launcher env is still set.
+set +e
+OUT="$(HOME="$LOCAL_HOME" WRK_HOSTS_CONFIG="$TMP/legacy-missing.toml" \
+  "$FLEET_REV" --only a 2>"$TMP/err")"
+RC=$?
+set -e
+[[ $RC -eq 0 ]] || fail "canonical config did not win: $RC $OUT $(cat "$TMP/err")"
+pass "legacy-only hosts config refuses rc 2 with migration fix; canonical config wins"
+
 
 # ================================================================ AC15 (993 N7)
 # The README scopefuel reinstall step labels the `git+...@<sha> --force`

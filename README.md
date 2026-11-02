@@ -115,8 +115,10 @@ bin/fleet-rev --extra mac-work=m1 --skip oci
 ```
 
 probe 대상 = `local`(ssh 없이 직접 probe) + `FLEET_HOSTS_CONFIG`
-(기본 `~/.config/fleet/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부. 주석 처리된
-테이블은 호스트가 아니다. 5대 = 이 Mac(local) + m1b + desktop + Pi +
+(기본 `~/.config/fleet/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부.
+정본 설정이 없는 상태에서 옛 `WRK_HOSTS_CONFIG`나 `wrk/hosts.toml`만 남아 있으면 rc 2로
+거절한다. `FLEET_HOSTS_CONFIG`를 의도한 파일로 지정하거나 `fleet/hosts.toml`로 옮긴다.
+주석 처리된 테이블은 호스트가 아니다. 5대 = 이 Mac(local) + m1b + desktop + Pi +
 M1(`--extra mac-work=m1`).
 
 각 호스트에는 `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> sh -s` 한 번으로

@@ -122,6 +122,8 @@ Who verifies, and when a subagent or a spawned worker does the work, is `robin-m
    from a recommend list. `pacelever --json` shows quota; `pacelever refresh <pool>` re-measures
    a stale pool. An explicit `-m` or `--host NAME` needs `--override-reason`, which is recorded.
 5. **Preview, then spawn** (`ops` spawn):
+   Omit `-w` to use the executing host's configured workspace. `-w <label|id>` remains an
+   optional override, resolved on that host; it does not select the model or quota pool.
    ```sh
    panewire spawn -c ~/work/<repo>.<slug> -m auto -p ~/work/herdr-inbox/jobs/<job>/brief.md \
      -l <job> --t <T> --task <id> --role worker --owner <repo-session-lane> \
