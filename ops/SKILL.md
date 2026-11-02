@@ -18,14 +18,17 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
   `panewire emit` (rc 0) proves nothing; check the receiving pane (`relay.md` §3).
   This check belongs to the **sender of instructions** (a parent lane or the desk
   injecting into a worker). It never applies upward.
-- **Workers and seats report upward only with `panewire emit --kind lane.event`.**
-  READY, ESC and every other notice to a parent lane or to operator-desk go through
-  the hub, which records delivery and holds or batches it for a busy receiver. Never
-  `herdr agent prompt`, `herdr pane send-text` or `send-keys` into the parent's or
-  the desk's pane: it lands in the operator's input box, bypasses hold/batching, and
-  can mix with what the operator is typing (2026-11-02 incident). If you cannot see
-  the receiver (another host, `runtug find` misses it), `emit` rc 0 is sufficient —
-  do not invent a fallback channel and do not raise an ESC about delivery.
+- **Never inject into operator-desk's pane.** READY, ESC and every other notice to
+  operator-desk go only through `panewire emit --kind lane.event --lane operator-desk`;
+  the desk is a claude pane, the hub records delivery and holds or batches it while
+  the desk is busy. `herdr agent prompt`, `herdr pane send-text` or `send-keys` into
+  the desk pane land in the operator's input box, bypass hold/batching and can mix
+  with what the operator is typing (2026-11-02 incident). The same holds for any
+  claude parent lane. If you cannot see the receiver (another host, `runtug find`
+  misses it), `emit` rc 0 is sufficient — no fallback channel, no ESC about delivery.
+  A **non-claude parent** (codex, grok, devin) does not receive `lane.event`; for that
+  parent only, keep the documented escalation route (§Escalate a decision: emit, then
+  `herdr agent prompt` to the parent pane and confirm it landed).
 - **A worker's self-report is not evidence.** Compare it with the artifact itself and
   `git ls-remote` before acting on it.
 - **No polling loops.** Wait for the pushed event or one bounded blocking wait

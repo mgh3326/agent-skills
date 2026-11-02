@@ -109,11 +109,12 @@ runtug find <이름|라벨> --pane-only  # 스크립트용
 ### 3-1. 완료 통지·pane kind 분기 정본
 
 🔴 **방향 규칙 (2026-11-02 사고):** 이 절의 직접주입·제출 검증은 **지시를 보내는 쪽**(부모 레인·desk → 워커)의 의무다.
-워커·좌석이 부모 레인이나 operator-desk 로 올리는 READY·ESC·보고는 **`panewire emit --kind lane.event` 만** 쓴다.
-부모나 desk 의 pane 에 `herdr agent prompt`·`pane send-text`·`send-keys` 로 쓰지 않는다 — 운영자 입력창에 꽂혀
+워커·좌석이 **operator-desk 또는 claude 부모 레인**으로 올리는 READY·ESC·보고는 **`panewire emit --kind lane.event` 만** 쓴다.
+그 pane 에 `herdr agent prompt`·`pane send-text`·`send-keys` 로 쓰지 않는다 — 운영자 입력창에 꽂혀
 제출되지 않은 채 남고, 허브의 보류·묶음 전달을 우회하며, 운영자가 치던 글과 섞인다.
 수신 pane 이 안 보이면(다른 호스트, `runtug find` 미검출) `emit` rc 0 으로 충분하다 — 폴백 채널을 만들거나
-"전달 미확인" ESC 를 내지 않는다.
+"전달 미확인" ESC 를 내지 않는다. **비-claude 부모(codex·grok·devin)** 는 `lane.event` 를 받지 못하므로 그 경우에만
+위 표의 직접주입 경로(SKILL.md §Escalate a decision)를 유지한다 — operator-desk 는 claude pane 이라 해당 없음.
 
 **`comms-contract: v1`** — 이 절이 통신 계약의 **정본이고 유일한 버전 출처**다.
 v1 의 요지: **완료를 아는 쪽(답변자·워커)이 요청자 레인으로 통지를 보낸다.**
