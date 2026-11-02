@@ -14,7 +14,7 @@ trap 'rm -rf "$TMP"' EXIT
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 
-export WRK_HOSTS_CONFIG="$TMP/hosts.toml"
+export FLEET_HOSTS_CONFIG="$TMP/hosts.toml"
 export FLEET_REV_SSH="$FIX/fake-ssh"
 export FLEET_REV_GH="$FIX/fake-gh"
 export FLEET_REV_SSH_LOG="$TMP/ssh.log"
@@ -25,7 +25,7 @@ LOCAL_HOME="$TMP/local-home"
 export FLEET_REV_FAKE_ROOT="$FAKE_ROOT"
 export FLEET_REV_FAKE_GH_DIR="$GHDIR"
 
-cat >"$WRK_HOSTS_CONFIG" <<'EOF'
+cat >"$FLEET_HOSTS_CONFIG" <<'EOF'
 [hosts.a]
 ssh = "x"
 [hosts.b]
@@ -477,7 +477,7 @@ grep -q '^b ' <<<"$OUT" || fail "AC7 --only b row missing"
 
 # wrk spillover shapes: the FIRST ssh= in a section wins, and a [hosts.NAME]
 # header with a trailing comment is still a header
-cat >"$WRK_HOSTS_CONFIG" <<'EOF'
+cat >"$FLEET_HOSTS_CONFIG" <<'EOF'
 [hosts.a]
 ssh = "x"
 ssh = "x2"
@@ -492,7 +492,7 @@ run_fleet
 grep -q 'x2' "$FLEET_REV_SSH_LOG" && fail "AC7 last ssh= won: $(cat "$FLEET_REV_SSH_LOG")"
 grep -q '^a ' <<<"$OUT" || fail "AC7 host a row missing"
 grep -q '^q ' <<<"$OUT" || fail "AC7 trailing-comment header q is not a host"
-cat >"$WRK_HOSTS_CONFIG" <<'EOF'
+cat >"$FLEET_HOSTS_CONFIG" <<'EOF'
 [hosts.a]
 ssh = "x"
 [hosts.b]
@@ -572,7 +572,7 @@ bad="$(grep -oE '>[0-9A-Za-z&/_.-]*' "$TMP/probe.sh" | grep -vE '^>(/dev/null|&[
 bad="$(grep -inE 'token|secret|\.env|id_rsa|netrc|\.aws|password|credential' "$TMP/probe.sh" || true)"
 [[ -z "$bad" ]] || fail "AC9 probe secret read: $bad"
 envnames="$(grep -oE 'environ\.get\("[A-Z_]+"|environ\["[A-Z_]+"\]' "$ROOT/bin/fleet-rev" | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u | tr '\n' ' ')"
-[[ "$envnames" == "FLEET_REV_GH FLEET_REV_SSH WRK_HOSTS_CONFIG XDG_CONFIG_HOME " ]] ||
+[[ "$envnames" == "FLEET_HOSTS_CONFIG FLEET_REV_GH FLEET_REV_SSH XDG_CONFIG_HOME " ]] ||
   fail "AC9 env reads: $envnames"
 
 # B1: the probe must not write .git/index — git's opportunistic index refresh
@@ -724,7 +724,7 @@ fi
 pass "AC13 hung handoffkeep -> unknown 'tool timed out', host stays reachable (N6)"
 
 # ================================================================ AC14 (993 CodeRabbit)
-# An explicitly set WRK_HOSTS_CONFIG that is missing or unreadable is a
+# An explicitly set FLEET_HOSTS_CONFIG that is missing or unreadable is a
 # usage error (rc 2, one stderr line) — not a silent local-only run. The
 # default path missing only warns once and probes local. Invariant: an
 # explicit missing config is an error.
@@ -737,26 +737,26 @@ set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
 full_current_home "$LOCAL_HOME"
 full_current_home "$(remote_home x)"
 
-export WRK_HOSTS_CONFIG="$TMP/no-such.toml"
+export FLEET_HOSTS_CONFIG="$TMP/no-such.toml"
 run_fleet --only local
 [[ $RC -eq 2 ]] || fail "AC14 missing explicit config rc: want 2 got $RC :: $OUT"
 [[ "$(printf '%s\n' "$ERR" | grep -c .)" -eq 1 ]] ||
   fail "AC14 stderr line count: $(printf '%s\n' "$ERR" | grep -c .) :: $ERR"
-[[ "$ERR" == *WRK_HOSTS_CONFIG* ]] ||
-  fail "AC14 stderr does not name WRK_HOSTS_CONFIG: $ERR"
+[[ "$ERR" == *FLEET_HOSTS_CONFIG* ]] ||
+  fail "AC14 stderr does not name FLEET_HOSTS_CONFIG: $ERR"
 
 # an unreadable explicit config errors the same way
 printf '[hosts.a]\nssh = "x"\n' >"$TMP/no-read.toml"
 chmod 000 "$TMP/no-read.toml"
-export WRK_HOSTS_CONFIG="$TMP/no-read.toml"
+export FLEET_HOSTS_CONFIG="$TMP/no-read.toml"
 run_fleet --only local
 [[ $RC -eq 2 ]] || fail "AC14 unreadable explicit config rc: want 2 got $RC :: $OUT"
 chmod 644 "$TMP/no-read.toml"
-export WRK_HOSTS_CONFIG="$TMP/hosts.toml"
+export FLEET_HOSTS_CONFIG="$TMP/hosts.toml"
 
 # unset -> default path missing -> one warning, local probed, rc as usual
 set +e
-OUT="$(HOME="$LOCAL_HOME" env -u WRK_HOSTS_CONFIG -u XDG_CONFIG_HOME \
+OUT="$(HOME="$LOCAL_HOME" env -u FLEET_HOSTS_CONFIG -u XDG_CONFIG_HOME \
   "$FLEET_REV" --only local 2>"$TMP/err")"
 RC=$?
 set -e
@@ -767,6 +767,20 @@ ERR="$(cat "$TMP/err")"
 [[ "$(awk '$2=="scopefuel"{print $1}' <<<"$OUT" | sort -u)" == "local" ]] ||
   fail "AC14 default-missing probed more than local: $OUT"
 pass "AC14 explicit missing/unreadable config rc 2; default missing warns once (CodeRabbit)"
+
+# The default probes the same canonical config as panewire.
+mkdir -p "$LOCAL_HOME/.config/fleet"
+printf '[hosts.a]\nssh = "x"\n' >"$LOCAL_HOME/.config/fleet/hosts.toml"
+set +e
+OUT="$(HOME="$LOCAL_HOME" env -u FLEET_HOSTS_CONFIG -u XDG_CONFIG_HOME \
+  "$FLEET_REV" --only a 2>"$TMP/err")"
+RC=$?
+set -e
+[[ $RC -eq 0 ]] || fail "canonical default config rc: $RC :: $OUT :: $(cat "$TMP/err")"
+[[ "$(awk '$2=="panewire"{print $1}' <<<"$OUT" | sort -u)" == "a" ]] ||
+  fail "canonical default config did not probe its host: $OUT"
+rm "$LOCAL_HOME/.config/fleet/hosts.toml"
+pass "canonical fleet config default selects the configured probe host"
 
 # ================================================================ AC15 (993 N7)
 # The README scopefuel reinstall step labels the `git+...@<sha> --force`

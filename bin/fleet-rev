@@ -3,7 +3,7 @@
 
 Probes the installed commit of scopefuel, agent-skills, panewire and
 handoffkeep on this machine plus every active [hosts.NAME] table in
-${WRK_HOSTS_CONFIG:-~/.config/wrk/hosts.toml} and compares each against that
+${FLEET_HOSTS_CONFIG:-~/.config/fleet/hosts.toml} and compares each against that
 repo's main on GitHub (org mgh3326).  The script never installs, restarts or
 writes anything: remote hosts get one fixed POSIX sh probe over
 `ssh -o BatchMode=yes -o ConnectTimeout=10 -- ALIAS sh -s` and the probe prints
@@ -388,13 +388,13 @@ def eprint(*args: object) -> None:
 
 
 def hosts_config_path() -> str:
-    override = os.environ.get("WRK_HOSTS_CONFIG")
+    override = os.environ.get("FLEET_HOSTS_CONFIG")
     if override:
         return override
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
         os.path.expanduser("~"), ".config"
     )
-    return os.path.join(xdg, "wrk", "hosts.toml")
+    return os.path.join(xdg, "fleet", "hosts.toml")
 
 
 def _toml_value(raw: str) -> str:
@@ -448,12 +448,12 @@ def build_hosts(args: argparse.Namespace, parser: argparse.ArgumentParser) -> li
     config_path = hosts_config_path()
     readable = os.path.isfile(config_path) and os.access(config_path, os.R_OK)
     if not readable:
-        if os.environ.get("WRK_HOSTS_CONFIG"):
+        if os.environ.get("FLEET_HOSTS_CONFIG"):
             # An explicitly set config that cannot be read is a usage error,
             # not a silent "probe local only".
             parser.exit(
                 EXIT_USAGE,
-                "%s: error: WRK_HOSTS_CONFIG=%s is missing or unreadable\n"
+                "%s: error: FLEET_HOSTS_CONFIG=%s is missing or unreadable\n"
                 % (PROG, config_path),
             )
         eprint(

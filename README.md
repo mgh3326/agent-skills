@@ -114,8 +114,8 @@ scripts/shellcheck-capped tests/test-ci-suites.sh
 bin/fleet-rev --extra mac-work=m1 --skip oci
 ```
 
-probe 대상 = `local`(ssh 없이 직접 probe) + `PANEWIRE_HOSTS_CONFIG`
-(기본 `~/.config/wrk/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부. 주석 처리된
+probe 대상 = `local`(ssh 없이 직접 probe) + `FLEET_HOSTS_CONFIG`
+(기본 `~/.config/fleet/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부. 주석 처리된
 테이블은 호스트가 아니다. 5대 = 이 Mac(local) + m1b + desktop + Pi +
 M1(`--extra mac-work=m1`).
 
