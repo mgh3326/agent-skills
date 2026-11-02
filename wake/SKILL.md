@@ -98,7 +98,7 @@ Who verifies, and when a subagent or a spawned worker does the work, is `robin-m
 
 1. **Task.** Decide and record on the hk task: grade, tier, urgency (hk priority 1–2 =
    urgent), capability tags (`unity`, `xcode`, `gpu`, `linux`; none = any host). Put the
-   marker in the title — runtug refuses without it, and refuses a `--t` that differs from it.
+   marker in the title — panewire refuses without it, and refuses a `--t` that differs from it.
    An implementation task owns one PR (`robin-mode` §Work boundary).
    ```sh
    handoffkeep tasks add --project <project> --title '<title> (grade <G>, <T>)' \
@@ -116,21 +116,21 @@ Who verifies, and when a subagent or a spawned worker does the work, is `robin-m
    spawned with `-c` set to this worktree: mergewake reap finds a PR's worker by the pane's cwd.
 3. **Brief.** Copy §Worker brief to `~/work/herdr-inbox/jobs/<job>/brief.md` and fill it
    following §Brief rules.
-4. **Model and host are runtug's.** With `-m auto` runtug filters the quota catalog by the
+4. **Model and host are panewire's.** With `-m auto` panewire filters the quota catalog by the
    task's grade, role and tags, orders pools by hk `policy/quota-stop` and admits the first candidate
    that passes presence and the quota gate; unknown evidence fails closed. Do not pick a model
    from a recommend list. `pacelever --json` shows quota; `pacelever refresh <pool>` re-measures
    a stale pool. An explicit `-m` or `--host NAME` needs `--override-reason`, which is recorded.
 5. **Preview, then spawn** (`ops` spawn):
    ```sh
-   runtug spawn -c ~/work/<repo>.<slug> -m auto -p ~/work/herdr-inbox/jobs/<job>/brief.md \
-     -w workers -l <job> --t <T> --task <id> --role worker --owner <repo-session-lane> \
+   panewire spawn -c ~/work/<repo>.<slug> -m auto -p ~/work/herdr-inbox/jobs/<job>/brief.md \
+     -l <job> --t <T> --task <id> --role worker --owner <repo-session-lane> \
      --host auto [--tags unity] --report ~/work/herdr-inbox/jobs/<job>/report.md --dry-run
    ```
    `-l <job>` is also the job id and the pane name mergewake looks up. Check profile, host and
    the prepended host-safety preamble, then run it without `--dry-run`. A refusal is read from
-   its exit code (runtug `docs/config.md`); it is never a reason to launch the task another way.
-6. **Landing check.** Confirm the brief was received (`ops` spawn §4-2), then stay idle until
+   its exit code (panewire `docs/config.md`); it is never a reason to launch the task another way.
+6. **Landing check.** `ACCEPTED` confirms only a durable reservation. Wait for `SPAWNED` or `SPAWN_FAILED`; then confirm the brief was received (`ops` spawn §4-2), then stay idle until
    the worker's READY/ESC arrives. No polling loops.
 7. **On READY** (§READY), verify the push yourself — `git ls-remote origin wk/<slug>` must show the
    reported head — and that the report is at its path outside the worktree (if not, copy it
@@ -235,9 +235,9 @@ not only where a reviewer pointed.
 A required check failed, or a critical/high finding is unresolved. Send the failing checks or
 findings to the PR's **current author attempt** (`ops` relay); it fixes them on the same branch.
 Do not spawn a fix worker while that attempt is alive. If the author attempt is terminal
-(exited, reaped or lost), the repo session accepts a new attempt: until runtug binds several
+(exited, reaped or lost), the repo session accepts a new attempt: until panewire binds several
 attempts to one task, create a follow-up hk task (`<title> — fix PR #<n>`, with `--expected`) and
-run the loop from step 3 on the same branch with a new job id and that task — runtug refuses a
+run the loop from step 3 on the same branch with a new job id and that task — panewire refuses a
 `--task` bound to another job. Never revive a terminal record or respawn a vanished pane blindly.
 If the fix needs a decision, escalate instead.
 
@@ -273,12 +273,12 @@ original guards. A temporary observation uses `panewire wait --agent NAME --stat
 ## Delegated seat
 
 A parent lane may spawn a seat to run this loop for one PR on its behalf
-(`runtug spawn --role builder --lane <seat-lane> --parent <parent-lane> --task <id>`; this role
+(`panewire spawn --role builder --lane <seat-lane> --parent <parent-lane> --task <id>`; this role
 refuses `--owner`).
 
 - **Identity.** `--task` is required; the spawn claims that task and binds `refs.job_id`.
   The seat's lane must be registered: the OK line ends in `lane=<lane>@<machine>`, and
-  `lane=UNREGISTERED` (rc 82 under `WRK_LANE_STRICT=1`) means escalations will be lost —
+  `lane=UNREGISTERED` (rc 82 under `PANEWIRE_LANE_STRICT=1`) means escalations will be lost —
   report it to the parent before doing anything else.
 - **Queue.** The seat reads and transitions only its own task
   (`handoffkeep tasks show|transition <id>`); it never runs `tasks next` or `tasks claim`.
@@ -321,7 +321,7 @@ refuses `--owner`).
   bound on any mutation); keep the gate light for free mock scope and strict for sealed,
   live or reserved resources.
 - Put prohibitions and safety constraints in the initial brief — an injection during a long
-  turn takes effect only when the model reads it. runtug prepends the fleet host-safety block
+  turn takes effect only when the model reads it. panewire prepends the fleet host-safety block
   (no local DB servers, changed tests only, stop your own PIDs, worktree only); do not repeat it.
 
 ## Operator confirmation provenance
@@ -405,7 +405,7 @@ contract. Do not widen scope to answer a finding.
 - Comparison or mutant copies come from `git clone` or `git worktree add`, never `cp -R` of a
   linked worktree.
 - Isolated HOME/XDG is for test and probe runs only; spawn, placement and delivery commands
-  (`pacelever`, `runtug`, `panewire`) run with the real HOME.
+  (`pacelever`, `panewire`, `panewire`) run with the real HOME.
 - Never ask a question in this pane — no confirmation prompt, no AskUserQuestion or other
   interactive chooser; nobody sees it and it blocks silently. On a decision emit
   `panewire emit --kind lane.event --lane <parent-lane> --type decision --event-id <job>-decision-<n> --text '[<job>] ESC | <question> | options: <A>/<B> | default: <A>'`

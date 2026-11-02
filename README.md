@@ -48,7 +48,7 @@ relay-handoff → `ops/references/relay.md`(+`session-questions.md`), consult-ad
 installer → `deploy.md`(+`deploy-checklist.md`), spawn-worker §4·§4.x·§6 → `spawn.md`·`spawn-hosts.md`·
 `reap.md`, director 결정 요청·감시 → `decision-request.md`·`watching.md`·`panewire-events.md`,
 spawn-worker §1~§3·builder 루프·director 권한·머지 게이트 → `wake`. planner·architect·linear-archive·node-ops·
-checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의존하던 `director/` 게이트(tester-eligible·merge-precheck)는 runtug 로 대체되며 삭제됐다. `director/gate_policy.json` 은 `local_sources` 해시 핀(ci.yml docs-only 분류기와 wake 가 읽음)만 남겼다.
+checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의존하던 `director/` 게이트(tester-eligible·merge-precheck)는 panewire 로 대체되며 삭제됐다. `director/gate_policy.json` 은 `local_sources` 해시 핀(ci.yml docs-only 분류기와 wake 가 읽음)만 남겼다.
 원문 복원: `git log --diff-filter=D --format=%H -1 -- <스킬>/SKILL.md`로 삭제 커밋을 찾고
 `git show <그 커밋>^:<스킬>/SKILL.md`.
 
@@ -82,7 +82,7 @@ checker와 tester 라운드 규칙은 옮기지 않았다. wrk 와 wrk 에 의�
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 | `fleet-rev` | 5호스트 설치 버전 점검(**읽기 전용**) — 호스트별 scopefuel·agent-skills·panewire·handoffkeep의 설치 커밋을 GitHub main과 대조해 current/behind/diverged를 표로 출력. 호스트당 ssh 1회 + 고정 POSIX sh probe(key=value만 출력); 설치·재시작·쓰기 명령 없음. `--extra NAME=ALIAS` · `--skip NAME` · `--only NAME[,NAME]` · `--timeout` · `--json` |
 
-> `wrk`(세션 스폰·reap·heavy CLI)는 runtug 로 대체되어 은퇴했다(hk 2323). runtug 는 `~/.config/wrk/hosts.toml` 을 그대로 읽는다.
+> `wrk`(세션 스폰·reap·heavy CLI)는 panewire 로 대체되어 은퇴했다(hk 2323). panewire 는 `~/.config/fleet/hosts.toml`을 읽는다(`FLEET_HOSTS_CONFIG`로 override).
 
 ## 의존 도구
 
@@ -114,7 +114,7 @@ scripts/shellcheck-capped tests/test-ci-suites.sh
 bin/fleet-rev --extra mac-work=m1 --skip oci
 ```
 
-probe 대상 = `local`(ssh 없이 직접 probe) + `WRK_HOSTS_CONFIG`
+probe 대상 = `local`(ssh 없이 직접 probe) + `PANEWIRE_HOSTS_CONFIG`
 (기본 `~/.config/wrk/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부. 주석 처리된
 테이블은 호스트가 아니다. 5대 = 이 Mac(local) + m1b + desktop + Pi +
 M1(`--extra mac-work=m1`).
@@ -156,7 +156,7 @@ exit code: `0` 전부 current · `1` behind/diverged 하나라도 있음 ·
 
 ```text
 scopefuel   쿼타·급·정책     "얼마 남았나"    ← arbiter 가 읽는 입력원
-(호출자)    세션 수명주기    "어떻게 띄우나"  (runtug)
+(호출자)    세션 수명주기    "어떻게 띄우나"  (panewire)
 arbiter     작업 조정        "누가 점유했나"
 ```
 

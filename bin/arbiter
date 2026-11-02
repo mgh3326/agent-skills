@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """arbiter — 작업 조정(admission control) 도구.
 
-도메인 경계(운영자 결정, ROB-1199): `호출자 → arbiter → scopefuel --json` (호출자였던 wrk 는 퇴역, runtug 로 대체).
+도메인 경계(운영자 결정, ROB-1199): `호출자 → arbiter → scopefuel --json` (호출자였던 wrk 는 퇴역, panewire 로 대체).
 - scopefuel : 쿼타·급·정책 ("얼마 남았나")  — arbiter 가 읽는 입력원. 역방향 의존 금지.
 - 호출자    : 세션 수명주기 ("어떻게 띄우나") — arbiter 를 호출하는 쪽.
 - arbiter   : 작업 조정 ("누가 점유했나")   — 이 파일.

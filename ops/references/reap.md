@@ -30,7 +30,7 @@ worktree 와 branch 를 지운다. **repo 세션은 머지 후 pane 을 손으�
 ```bash
 arbiter status --lane <내 레인> --json     # 내 job 목록 (세션 기억 아님)
 # 각 job → jobs/<job_id>/events/*job.claim.json 의 agent_label
-runtug find <agent_label>                  # → pane_id · status
+panewire find <agent_label>                  # → pane_id · status
 herdr pane close <pane_id>                 # 회수
 ```
 🔴 **세션 기억으로 목록을 만들지 마라.** compact 되면 사라진다. 정본은 arbiter + job 이벤트다.
@@ -67,19 +67,19 @@ herdr pane list → 해당 workspace pane 전수
                                                          보고서가 지정 경로에 있을 때만 닫는다. 아니면 둔다
   ③ 그 외 (판별 불가)                                 → 화면을 읽고 판단
 ```
-- runtug 는 스폰 실패 시 실패 pane 의 화면을 잡 디렉터리에 남기고 그 pane 을 닫는다(남겨 두는
+- panewire 는 스폰 실패 시 실패 pane 의 화면을 잡 디렉터리에 남기고 그 pane 을 닫는다(남겨 두는
   옵션은 없다). 비정상 종료·수동 스폰 잔해는 계속 생기므로 스윕은 여전히 필요하다.
 - ②를 닫아도 잃는 것은 종료된 에이전트의 스크롤백뿐이다 — 산출물 정본은 `jobs/<id>/` 파일이다.
 - worktree 는 pane 과 별개다 — pane 을 닫아도 worktree 는 남는다.
 
-### 6-6. `runtug reap` — 끝난 pane 일괄 회수
+### 6-6. `panewire reap` — 끝난 pane 일괄 회수
 
-수동 회수는 놓친다(2026-09-04 하루에 pane 40~60개가 쌓여 ~50개를 손으로 닫았다). `runtug reap` 은
+수동 회수는 놓친다(2026-09-04 하루에 pane 40~60개가 쌓여 ~50개를 손으로 닫았다). `panewire reap` 은
 **잡 이벤트가 증명한 것만** 닫는다.
 
 ```bash
-runtug reap --lane <내 레인>              # 미리보기: job=… action=reap|keep reason=…
-runtug reap --lane <내 레인> --apply      # 실제 회수
+panewire reap --lane <내 레인>              # 미리보기: job=… action=reap|keep reason=…
+panewire reap --lane <내 레인> --apply      # 실제 회수
 ```
 
 - 후보: terminal 잡이고, 그 뒤에 새 claim·reclaim·spawn 이 없고, `--grace`(기본 10m)가 지났고,
@@ -89,11 +89,11 @@ runtug reap --lane <내 레인> --apply      # 실제 회수
   `job.reaped` 를 남긴다.
 - 위임 좌석 pane 은 `--include-builders` 없이는 제외한다. `--worktrees` 는 깨끗하고 origin/main 에
   머지된 linked worktree 만 force 없이 지운다(branch 는 남는다).
-- 🔴 runtug 는 `--apply` 에 `--lane` 을 강제하지 않는다 — 전역 회수는 금지이므로 항상
+- 🔴 panewire 는 `--apply` 에 `--lane` 을 강제하지 않는다 — 전역 회수는 금지이므로 항상
   `--lane <내 레인>` 을 준다.
-- `runtug prune` 은 같은 규칙에 더해, pane 이 사라진 채 마지막 이벤트가 `--stale-age`(기본 24h)보다
+- `panewire prune` 은 같은 규칙에 더해, pane 이 사라진 채 마지막 이벤트가 `--stale-age`(기본 24h)보다
   오래된 live 잡을 정리한다.
-- 🔴 `runtug reap` 은 §6-4 의 예외가 아니다 — 닫는 것은 runtug 가 그 잡을 위해 만든 pane 뿐이고,
+- 🔴 `panewire reap` 은 §6-4 의 예외가 아니다 — 닫는 것은 panewire 가 그 잡을 위해 만든 pane 뿐이고,
   수동 회수는 여전히 `pane close` 다. §6-2 의 **1번(job 이 terminal 인가)도 대신 판단하지 않는다**
   — 결정을 기다리며 idle 인 세션(§6-3)에는 terminal 이벤트가 없으므로 자동으로 제외된다.
 

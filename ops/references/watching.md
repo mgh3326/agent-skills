@@ -57,7 +57,7 @@
 
 - 허용되는 유일한 능동 대기는 **bounded timeout 있는 블로킹 명령 1개**
   (`panewire wait --agent <이름> --status idle --settle 60s --timeout <한계>`
-  등 — `--timeout` 은 필수 인자다)다. `runtug spawn … --wait --wait-timeout <한계>` 도
+  등 — `--timeout` 은 필수 인자다)다. `panewire spawn … --wait --wait-timeout <한계>` 도
   같은 1개로 센다(rc 0 완료·READY, 83 ESC, 84 lost·revoked, 85 timeout). 그 종료는 완료
   증거가 아니라 깨어남 신호다 — wait 종료 후의 판정은 언제나 산출물이다. `panewire wait --agent`는
   로컬 herdr 소켓만 본다 — 원격 배치 워커에는 쓸 수 없다.
@@ -74,7 +74,7 @@ panewire R19a 계약은 두 종류의 이벤트를 같이 소비한다.
 
 - arbiter 산출물은 envelope이다: `job_id`, `seq`, `kind`, `payload`, `created_at`. 위임 좌석 claim의
   `payload.parent_lane`이 상위 목적지다.
-- `runtug done`·`runtug escalate`는 `arbiter event`로 기록하므로 같은 envelope이다(runtug에는
+- `panewire done`·`panewire escalate`는 `arbiter event`로 기록하므로 같은 envelope이다(panewire에는
   `joined`가 없다). 평면 레코드는 옛 launcher 잡의 events 디렉터리에만 있다.
   위임 좌석의 `job.escalate`는 `owner_lane`에 **좌석 자신의 레인**을 기록하고,
   정보용 `parent_lane`도 함께 기록한다. `parent_lane`은 라우팅 근거가 아니다. R19a는

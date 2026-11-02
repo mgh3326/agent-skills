@@ -14,11 +14,11 @@
 
 - 질의 전 요청자 레인이 hub에 등록되어 있는지 확인한다. 미등록 레인의 emit은 조용히 유실된다
   (근거: 2026-09-14 실사고 — 6건 전량 드롭, 부분 배달 0).
-- **세션 이름 지정 시**: `runtug find <이름>`으로 상존·화면 확인 → 있으면 **`relay.md`의 질의
+- **세션 이름 지정 시**: `panewire find <이름>`으로 상존·화면 확인 → 있으면 **`relay.md`의 질의
   절차**로 질의. 없으면 아래 경로로.
 - **프로필·계열·effort 는 hk `policy/model-routing` 이 정한다** — 이 문서에 모델명이나 자격표를
   적지 않는다. 고르는 방법:
-  `runtug resolve --role consult --builder-family <질문자 계열>` 의 마지막 줄 `profile=<이름>
+  `panewire resolve --role consult --builder-family <질문자 계열>` 의 마지막 줄 `profile=<이름>
   effort=<rung>` 을 스폰의 `-m`·`--effort` 로 쓴다. resolve 가 거부하거나 고른 프로필이 질문자와
   같은 계열이면 다른 프로필을 직접 고르지 말고 부모 레인에 결정을 올린다(`ops` §Escalate a
   decision).
@@ -49,15 +49,15 @@ herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>
 
 ```bash
 # 이름: consult-<주제> (전역 유일). cwd = 질의 대상 자료가 있는 repo/디렉토리
-runtug spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --t <task 의 T> \
-  --role counsel --routing-role consult --keep --override-reason '<사유: runtug resolve 결과>' \
+panewire spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --t <task 의 T> \
+  --role counsel --routing-role consult --keep --override-reason '<사유: panewire resolve 결과>' \
   [--parent-job <내 잡>] --report ~/work/herdr-inbox/jobs/consult-<주제>/answer.md --effort <resolve 의 rung>
 ```
 - 자문도 task 에 묶인다(`spawn.md` §무인 실행·task 기록). 잡 안의 pane 이면 `ARBITER_JOB` 으로
   부모 잡을 상속하고, 아니면 `--parent-job <관련 잡>` 을 주거나 자문용 hk task(제목에
   `(grade <G>, T0)`)를 만들어 `--task` 로 준다. `--t` 는 묶인 task 표식의 T 와 같아야 한다.
 - `--report` 는 자문 잡(또는 부모 잡) 디렉터리 안이어야 하므로 답변 파일도 그 경로로 지정한다.
-- `--keep` 은 보호 표시다(#603): 자문 세션은 답변 뒤에도 후속 질의를 받으므로 `runtug reap` 이
+- `--keep` 은 보호 표시다(#603): 자문 세션은 답변 뒤에도 후속 질의를 받으므로 `panewire reap` 이
   후보로 올리지 않고, mergewake reap 도 `consult-*` 이름을 닫지 않는다. 다 쓴 자문 pane 은
   요청자가 직접 닫는다.
 - 주입·제출검증 = **`relay.md` §3**, pane kind별 통지·대기·착지 확인의 정본과
@@ -89,7 +89,7 @@ runtug spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-
 - **상존 세션 질의가 나은 경우**: 그 세션의 컨텍스트가 자산일 때(예: repo 세션의 전황, 분석을
   직접 쓴 세션). 이때는 스폰 없이 `relay.md`의 질의 절차로.
 - (예외) 단답 확인·형식 검증처럼 맥락 보존 가치가 없는 질문만 headless 1회성 허용 — 모델과
-  effort 는 같은 `runtug resolve --role consult` 결과를 그 하네스의 비대화형 실행에 넘긴다.
+  effort 는 같은 `panewire resolve --role consult` 결과를 그 하네스의 비대화형 실행에 넘긴다.
 
 ## 4. 회수·기록·채택
 

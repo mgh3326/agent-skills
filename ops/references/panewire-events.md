@@ -87,7 +87,7 @@ limit를 허브 수명에 묶어 허브 자체가 단일 장애점이 되고, �
   `relay.unrouted`), handoffkeep 이 설정돼 있으면 이벤트는 영속이 성공해야
   주입된다(relay.go:418-425·773-781 @e401923 — `lane.event`뿐 아니라 `job.*`
   도 같다).
-  `runtug spawn` 에 `--owner`(위임 좌석은 `--lane`)가 빠지면 `default` 로 들어가 push 는 오지
+  `panewire spawn` 에 `--owner`(위임 좌석은 `--lane`)가 빠지면 `default` 로 들어가 push 는 오지
   않는다. 레인 pane 주입의 마지막 구간은 수신 측 노드(mac, 미측정)에 달렸다
   — pane 주입 자체는 `panewire prompt` 경로로 매일 관측되는 구간이다. mac 노드
   판은 operator 자격이 있는 쪽에서 허브 `GET /v1/nodes` 로 측정할 수 있다

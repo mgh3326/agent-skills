@@ -1,7 +1,7 @@
 # fleet-install — fleet tool release installer
 
 `bin/fleet-install` replaces the desk's ad-hoc install script for the tagged
-fleet tools (runtug, pacelever, mergewake, …). One command downloads a GitHub
+fleet tools (panewire, pacelever, mergewake, …). One command downloads a GitHub
 release, verifies `SHA256SUMS`, installs the right `<tool>-<os>-<arch>` binary
 on the operator host and each named remote, then runs the restart hooks from a
 local-only config file.

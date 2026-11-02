@@ -61,35 +61,35 @@ mk_host() { # ALIAS ARCH
 # ── 1. happy path: local + two hosts, restart hooks ─────────────────────
 reset_env
 LA="$(local_arch)"
-mk_release runtug v9 "$LA" linux-arm64 linux-amd64
+mk_release panewire v9 "$LA" linux-arm64 linux-amd64
 mk_host a linux-arm64
 mk_host b linux-amd64
 cat >"$FLEET_INSTALL_CONFIG" <<EOF
-[tool.runtug.local]
+[tool.panewire.local]
 restart = ["touch $TMP/local-restarted"]
-[tool.runtug.host.b]
+[tool.panewire.host.b]
 restart = ["touch \$HOME/b-restarted"]
 EOF
 
 out="$(FLEET_INSTALL_WAIT_TIMEOUT=5 FLEET_INSTALL_POLL_INTERVAL=1 \
-  "$FLEET_INSTALL" runtug v9 --hosts a,b)"
-[[ -x "$FLEET_INSTALL_BIN_DIR/runtug" ]] || fail "local binary missing"
-[[ "$("$FLEET_INSTALL_BIN_DIR/runtug" --version)" == "runtug v9 (runtug-$LA)" ]] \
+  "$FLEET_INSTALL" panewire v9 --hosts a,b)"
+[[ -x "$FLEET_INSTALL_BIN_DIR/panewire" ]] || fail "local binary missing"
+[[ "$("$FLEET_INSTALL_BIN_DIR/panewire" --version)" == "panewire v9 (panewire-$LA)" ]] \
   || fail "local --version wrong"
-[[ -x "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] || fail "host a binary missing"
-[[ -x "$FLEET_INSTALL_FAKE_ROOT/b/.local/bin/runtug" ]] || fail "host b binary missing"
-[[ "$("$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" --version)" == "runtug v9 (runtug-linux-arm64)" ]] \
+[[ -x "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" ]] || fail "host a binary missing"
+[[ -x "$FLEET_INSTALL_FAKE_ROOT/b/.local/bin/panewire" ]] || fail "host b binary missing"
+[[ "$("$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" --version)" == "panewire v9 (panewire-linux-arm64)" ]] \
   || fail "host a got the wrong arch artifact"
-[[ "$("$FLEET_INSTALL_FAKE_ROOT/b/.local/bin/runtug" --version)" == "runtug v9 (runtug-linux-amd64)" ]] \
+[[ "$("$FLEET_INSTALL_FAKE_ROOT/b/.local/bin/panewire" --version)" == "panewire v9 (panewire-linux-amd64)" ]] \
   || fail "host b got the wrong arch artifact"
 # .new was renamed into place, not left behind
-[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug.new" ]] || fail "host a .new left behind"
+[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire.new" ]] || fail "host a .new left behind"
 # scp uploaded the arm64 artifact to a and amd64 to b
-grep -q "runtug-linux-arm64 a:" "$FLEET_INSTALL_SCP_LOG" || fail "scp log missing a arm64"
-grep -q "runtug-linux-amd64 b:" "$FLEET_INSTALL_SCP_LOG" || fail "scp log missing b amd64"
+grep -q "panewire-linux-arm64 a:" "$FLEET_INSTALL_SCP_LOG" || fail "scp log missing a arm64"
+grep -q "panewire-linux-amd64 b:" "$FLEET_INSTALL_SCP_LOG" || fail "scp log missing b amd64"
 # version printed per host
-printf '%s' "$out" | grep -q "a: runtug v9" || fail "no version line for a"
-printf '%s' "$out" | grep -q "b: runtug v9" || fail "no version line for b"
+printf '%s' "$out" | grep -q "a: panewire v9" || fail "no version line for a"
+printf '%s' "$out" | grep -q "b: panewire v9" || fail "no version line for b"
 # restart hooks: local ran, b ran over ssh, a had none
 [[ -f "$TMP/local-restarted" ]] || fail "local restart hook did not run"
 [[ -f "$FLEET_INSTALL_FAKE_ROOT/b/b-restarted" ]] || fail "host b restart hook did not run"
@@ -98,55 +98,55 @@ pass "happy path: local + hosts a,b with restarts"
 
 # ── 2. dry-run installs nothing ──────────────────────────────────────────
 reset_env
-mk_release runtug v9 "$LA" linux-arm64
+mk_release panewire v9 "$LA" linux-arm64
 mk_host a linux-arm64
-out="$("$FLEET_INSTALL" runtug v9 --hosts a --dry-run)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a --dry-run)"
 printf '%s' "$out" | grep -q "dry-run" || fail "no dry-run output"
-[[ ! -e "$FLEET_INSTALL_BIN_DIR/runtug" ]] || fail "dry-run installed locally"
-[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] || fail "dry-run installed on a"
+[[ ! -e "$FLEET_INSTALL_BIN_DIR/panewire" ]] || fail "dry-run installed locally"
+[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" ]] || fail "dry-run installed on a"
 [[ ! -s "$FLEET_INSTALL_SCP_LOG" ]] || fail "dry-run ran scp"
 pass "dry-run"
 
 # ── 3. dead host -> rc 1, other targets still install ────────────────────
 reset_env
-mk_release runtug v9 "$LA" linux-arm64
+mk_release panewire v9 "$LA" linux-arm64
 mk_host a linux-arm64
 mk_host b linux-arm64
 export FLEET_INSTALL_FAKE_DEAD=b
 set +e
-out="$("$FLEET_INSTALL" runtug v9 --hosts a,b 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a,b 2>&1)"
 rc=$?
 set -e
 unset FLEET_INSTALL_FAKE_DEAD
 [[ $rc -eq 1 ]] || fail "dead host should exit 1, got $rc"
-[[ -x "$FLEET_INSTALL_BIN_DIR/runtug" ]] || fail "local install skipped after host failure"
-[[ -x "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] || fail "host a skipped after b failure"
+[[ -x "$FLEET_INSTALL_BIN_DIR/panewire" ]] || fail "local install skipped after host failure"
+[[ -x "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" ]] || fail "host a skipped after b failure"
 printf '%s' "$out" | grep -q "failed targets: b" || fail "missing failed-targets line"
 pass "dead host exits 1, rest still installed"
 
 # ── 4. corrupt SHA256SUMS -> rc 3, nothing installed ─────────────────────
 reset_env
-mk_release runtug v9 "$LA" linux-arm64
+mk_release panewire v9 "$LA" linux-arm64
 mk_host a linux-arm64
 export FLEET_INSTALL_FAKE_BADSHA=1
 set +e
-out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a 2>&1)"
 rc=$?
 set -e
 unset FLEET_INSTALL_FAKE_BADSHA
 [[ $rc -eq 3 ]] || fail "bad checksum should exit 3, got $rc"
-[[ ! -e "$FLEET_INSTALL_BIN_DIR/runtug" ]] || fail "installed despite bad checksum"
-[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] || fail "installed on a despite bad checksum"
+[[ ! -e "$FLEET_INSTALL_BIN_DIR/panewire" ]] || fail "installed despite bad checksum"
+[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" ]] || fail "installed on a despite bad checksum"
 pass "checksum failure exits 3 before installing"
 
 # ── 5. release run never completes -> rc 3 timeout ───────────────────────
 reset_env
-printf 'runtug-%s\n' "$LA" >"$FLEET_INSTALL_FAKE_DIR/runtug.release"
+printf 'panewire-%s\n' "$LA" >"$FLEET_INSTALL_FAKE_DIR/panewire.release"
 printf '[{"status":"in_progress","conclusion":null}]\n' \
-  >"$FLEET_INSTALL_FAKE_DIR/runtug.run"
+  >"$FLEET_INSTALL_FAKE_DIR/panewire.run"
 set +e
 out="$(FLEET_INSTALL_WAIT_TIMEOUT=1 FLEET_INSTALL_POLL_INTERVAL=1 \
-  "$FLEET_INSTALL" runtug v9 2>&1)"
+  "$FLEET_INSTALL" panewire v9 2>&1)"
 rc=$?
 set -e
 [[ $rc -eq 3 ]] || fail "wait timeout should exit 3, got $rc"
@@ -155,10 +155,10 @@ pass "release wait timeout exits 3"
 
 # ── 6. missing artifact for a host's arch -> that host fails ─────────────
 reset_env
-mk_release runtug v9 "$LA" linux-amd64
+mk_release panewire v9 "$LA" linux-amd64
 mk_host a linux-arm64
 set +e
-out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a 2>&1)"
 rc=$?
 set -e
 [[ $rc -eq 1 ]] || fail "missing artifact should exit 1, got $rc"
@@ -168,54 +168,54 @@ pass "missing artifact marks host failed"
 
 # ── 7. artifact missing from SHA256SUMS -> refused ───────────────────────
 reset_env
-mk_release runtug v9 "$LA" linux-arm64
+mk_release panewire v9 "$LA" linux-arm64
 mk_host a linux-arm64
-export FLEET_INSTALL_FAKE_OMIT=runtug-linux-arm64
+export FLEET_INSTALL_FAKE_OMIT=panewire-linux-arm64
 set +e
-out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a 2>&1)"
 rc=$?
 set -e
 unset FLEET_INSTALL_FAKE_OMIT
 [[ $rc -eq 1 ]] || fail "unlisted artifact should exit 1, got $rc"
 printf '%s' "$out" | grep -q "not listed in SHA256SUMS" \
   || fail "missing not-listed message"
-[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" ]] \
+[[ ! -e "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" ]] \
   || fail "installed an artifact absent from SHA256SUMS"
 pass "artifact absent from SHA256SUMS refused"
 
 # ── 8. staged .new fails --version -> old binary kept ────────────────────
 reset_env
-mk_release runtug v9 "$LA" linux-arm64
+mk_release panewire v9 "$LA" linux-arm64
 mk_host a linux-arm64
-printf '#!/bin/sh\necho "runtug v8 (runtug-linux-arm64)"\n' \
-  >"$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug"
-chmod 755 "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug"
-export FLEET_INSTALL_FAKE_BROKEN=runtug-linux-arm64
+printf '#!/bin/sh\necho "panewire v8 (panewire-linux-arm64)"\n' \
+  >"$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire"
+chmod 755 "$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire"
+export FLEET_INSTALL_FAKE_BROKEN=panewire-linux-arm64
 set +e
-out="$("$FLEET_INSTALL" runtug v9 --hosts a 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 --hosts a 2>&1)"
 rc=$?
 set -e
 unset FLEET_INSTALL_FAKE_BROKEN
 [[ $rc -eq 1 ]] || fail "broken .new should exit 1, got $rc"
-[[ "$("$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/runtug" --version)" \
-  == "runtug v8 (runtug-linux-arm64)" ]] \
+[[ "$("$FLEET_INSTALL_FAKE_ROOT/a/.local/bin/panewire" --version)" \
+  == "panewire v8 (panewire-linux-arm64)" ]] \
   || fail "old binary was replaced by a broken .new"
 pass "broken staged .new leaves the old binary in place"
 
 # ── 9. --workflow is forwarded to gh run list ────────────────────────────
 reset_env
-mk_release runtug v9 "$LA"
-"$FLEET_INSTALL" runtug v9 --workflow release.yml >/dev/null
+mk_release panewire v9 "$LA"
+"$FLEET_INSTALL" panewire v9 --workflow release.yml >/dev/null
 grep -q "run list .*--workflow release.yml" "$FLEET_INSTALL_GH_LOG" \
   || fail "--workflow not forwarded to gh run list"
 pass "--workflow forwarded to gh run list"
 
 # ── 10. non-array restart is a usage error, not a crash ──────────────────
 reset_env
-mk_release runtug v9 "$LA"
-printf '[tool.runtug.local]\nrestart = "oops"\n' >"$FLEET_INSTALL_CONFIG"
+mk_release panewire v9 "$LA"
+printf '[tool.panewire.local]\nrestart = "oops"\n' >"$FLEET_INSTALL_CONFIG"
 set +e
-out="$("$FLEET_INSTALL" runtug v9 2>&1)"
+out="$("$FLEET_INSTALL" panewire v9 2>&1)"
 rc=$?
 set -e
 [[ $rc -eq 2 ]] || fail "scalar restart should exit 2, got $rc: $out"

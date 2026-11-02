@@ -104,8 +104,8 @@ check_deps() {
       [ "$name" = scopefuel ] || ok=1
     fi
   done
-  # wake-method tools are optional until runtug leaves shadow migration.
-  for name in runtug pacelever mergewake; do
+  # Fleet tools are optional dependencies of the wake method.
+  for name in panewire pacelever mergewake; do
     path="$(command -v "$name" || true)"
     if [ -n "$path" ]; then echo "  ✓ $name ($path)"
     else echo "  · $name — 미설치 (선택: wake 방식 도구)"; fi

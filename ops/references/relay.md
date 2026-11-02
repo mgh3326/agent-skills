@@ -33,11 +33,11 @@
    **`T 제안: Tn (근거: …)` 형식으로 반드시 적는다**(`wake` §Tier, 최종 판정은 repo
    세션이 서명) — 명시가 없으면 수신측이 최대 강도로 해석해 과잉검증이 난다. 검증 강도는
    `wake` §Tier 가 정한다(T1 이상은 워커 1명 + 독립 mergewake review).
-   🔴 **스폰 방식도 적어라** — PR 은 runtug 로 스폰한 워커가 맡는다(`robin-mode` §Subagents
+   🔴 **스폰 방식도 적어라** — PR 은 panewire 로 스폰한 워커가 맡는다(`robin-mode` §Subagents
    versus spawned workers). 비워두면 수신측이 PR 자체를 자기 세션 안에서 처리해 급 배정·쿼타
    분산·독립 리뷰가 우회된다(2026-08-01 ROB-1196 실사고: T3 실행계약 코드를 수신 세션 안에서
    구현·검증까지 처리).
-   **모델명은 적지 않는다** — 급(S+~C)은 hk task 제목 표식이 되고 모델은 runtug 자동 선택이 고른다.
+   **모델명은 적지 않는다** — 급(S+~C)은 hk task 제목 표식이 되고 모델은 panewire 자동 선택이 고른다.
    **급을 모르겠으면 비워두고 "작업 성격"만 적어라** — 급 판정은 스폰하는 쪽(repo 세션) 책임이다.
    상류가 어설프게 매기면 오배정이 난다(ROB-1189: 상류가 T1/B 로 매겨 두 번 BLOCKED).
 
@@ -66,16 +66,16 @@
 
 ## 2. 대상 검증 (오배송 방지)
 
-기억으로 라우팅 금지. **`runtug find`가 표준 해석 경로**다 — 이름 조회 → 없으면 탭 라벨 폴백 →
+기억으로 라우팅 금지. **`panewire find`가 표준 해석 경로**다 — 이름 조회 → 없으면 탭 라벨 폴백 →
 후보의 화면 마지막 줄까지 함께 낸다(실판별이 규율이 아니라 기본 동작이 된다).
 
 ```bash
-runtug find <이름|라벨>              # pane_id + cwd + 화면 미리보기
-runtug find <이름|라벨> --pane-only  # 스크립트용
+panewire find <이름|라벨>              # pane_id + cwd + 화면 미리보기
+panewire find <이름|라벨> --pane-only  # 스크립트용
 ```
 
 화면을 보고 **직전 작업 내용(KR/US/crypto·역할)이 기대와 맞는지** 확인한 뒤에만 주입한다.
-라벨이 여러 pane에 걸리면 `runtug find`가 전부 표시하고 실패한다 — 자동 선택하지 말 것.
+라벨이 여러 pane에 걸리면 `panewire find`가 전부 표시하고 실패한다 — 자동 선택하지 말 것.
 
 ⚠️ **이름은 유실될 수 있다** — 재부팅·세션 재시작으로 agent 이름이 날아가도 **탭 라벨은
 살아남는 경우가 많다**(07-31 실측: 재부팅 후 `orch` 포함 다수가 무명이 됐으나 라벨은 보존).
@@ -94,7 +94,7 @@ runtug find <이름|라벨> --pane-only  # 스크립트용
 **타겟 네이밍 관례**: 1순위 타겟은 **agent 이름**(`herdr agent rename <pane> <이름>`), 폴백은
 탭 라벨이다. 관례: repo 세션=`<repo>-integrator` / 운영자 대화 세션=`<도구>-<용도>`(예 `kiro-mock`) /
 위임 좌석=`<도메인>-builder` / 워커=`<잡 id>`. **탭 생성 시 라벨을 같은 이름으로 넣어두면**
-이름이 유실돼도 `runtug find`가 찾고 `runtug name-sync --apply`로 일괄 복구된다. 이름이 좋아도
+이름이 유실돼도 `panewire find`가 찾고 `panewire name-sync --apply`로 일괄 복구된다. 이름이 좋아도
 화면 실판별은 생략 금지.
 
 ### 2.x 원격 호스트 세션 (herdr-mirror, 2026-09-02)
@@ -112,7 +112,7 @@ runtug find <이름|라벨> --pane-only  # 스크립트용
 워커·좌석이 **operator-desk 또는 claude 부모 레인**으로 올리는 READY·ESC·보고는 **`panewire emit --kind lane.event` 만** 쓴다.
 그 pane 에 `herdr agent prompt`·`pane send-text`·`send-keys` 로 쓰지 않는다 — 운영자 입력창에 꽂혀
 제출되지 않은 채 남고, 허브의 보류·묶음 전달을 우회하며, 운영자가 치던 글과 섞인다.
-수신 pane 이 안 보이면(다른 호스트, `runtug find` 미검출) `emit` rc 0 으로 충분하다 — 폴백 채널을 만들거나
+수신 pane 이 안 보이면(다른 호스트, `panewire find` 미검출) `emit` rc 0 으로 충분하다 — 폴백 채널을 만들거나
 "전달 미확인" ESC 를 내지 않는다. **비-claude 부모(codex·grok·devin)** 는 `lane.event` 를 받지 못하므로 그 경우에만
 위 표의 직접주입 경로(SKILL.md §Escalate a decision)를 유지한다 — operator-desk 는 claude pane 이라 해당 없음.
 
@@ -273,11 +273,11 @@ grok 의 대기 상태(`N queued, Enter to send now`)는 공유 화면에서 페
   페이로드 귀속이 불가하므로 착지 주장은 배너가 아니라 소비 마커로 한다 — 배너·
   소비 마커 원문의 정본은 §3-2 하네스별 제출 마커 표다.
 - **fix·재작업 라운드의 보고 경로는 그대로 둬도 된다(#1014).** 워커가 같은
-  report 경로(`report.md`)를 갱신해 `runtug done` 하면, 같은 내용은 걸러지고 바뀐
+  report 경로(`report.md`)를 갱신해 `panewire done` 하면, 같은 내용은 걸러지고 바뀐
   내용은 스냅샷 경로로 레코드·업로드·relay 된다 — 같은 경로+다른 내용의
   `job.completed`는 panewire emit의 outbox 키 `(kind, job, epoch, report_path,
   reason)` 충돌로 rc 6 거부되기 때문이다. 후속 라운드 지시에 새 보고 경로를 요구할
-  필요가 없고, emit이 실패하면 `runtug done`은 `job.relay_failed`를 남기고
+  필요가 없고, emit이 실패하면 `panewire done`은 `job.relay_failed`를 남기고
   `relay=file-only`를 보인다.
 
 ## 4. 완료 보고 형식
