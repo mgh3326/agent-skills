@@ -448,6 +448,20 @@ def build_hosts(args: argparse.Namespace, parser: argparse.ArgumentParser) -> li
     config_path = hosts_config_path()
     readable = os.path.isfile(config_path) and os.access(config_path, os.R_OK)
     if not readable:
+        legacy_override = os.environ.get("WRK_HOSTS_CONFIG")
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+        legacy_path = os.path.join(xdg, "wrk", "hosts.toml")
+        if not os.environ.get("FLEET_HOSTS_CONFIG") and (
+            legacy_override or os.path.lexists(legacy_path)
+        ):
+            parser.exit(
+                EXIT_USAGE,
+                "%s: error: legacy hosts config detected without a readable fleet config; "
+                "set FLEET_HOSTS_CONFIG to the intended file or migrate wrk/hosts.toml "
+                "to fleet/hosts.toml before probing\n" % PROG,
+            )
         if os.environ.get("FLEET_HOSTS_CONFIG"):
             # An explicitly set config that cannot be read is a usage error,
             # not a silent "probe local only".
