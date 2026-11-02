@@ -130,8 +130,14 @@ Who verifies, and when a subagent or a spawned worker does the work, is `robin-m
    `-l <job>` is also the job id and the pane name mergewake looks up. Check profile, host and
    the prepended host-safety preamble, then run it without `--dry-run`. A refusal is read from
    its exit code (panewire `docs/config.md`); it is never a reason to launch the task another way.
-6. **Landing check.** `ACCEPTED` confirms only a durable reservation. Wait for `SPAWNED` or `SPAWN_FAILED`; then confirm the brief was received (`ops` spawn §4-2), then stay idle until
-   the worker's READY/ESC arrives. No polling loops.
+6. **Landing check.** `ACCEPTED` confirms only a durable reservation. The hub records
+   `SPAWNED` / `SPAWN_FAILED` as `lane.event` to the owner/parent lane and as hk job events.
+   Use one bounded `panewire inbox wait --lane <owner-lane> --timeout 11m --json`
+   if a blocking wake-up is needed; match the job/request, not an unrelated unread item
+   (`ops` watching §스폰 후 대기). On `SPAWN_FAILED`, report rc/stage/reason to the parent;
+   timeout or disconnect requires reconciliation before any new launch. On `SPAWNED`,
+   confirm the brief was received (`ops` spawn §4-2), then stay idle until the worker's
+   READY/ESC arrives. No polling loops.
 7. **On READY** (§READY), verify the push yourself — `git ls-remote origin wk/<slug>` must show the
    reported head — and that the report is at its path outside the worktree (if not, copy it
    from the live pane now: the pane is closed after merge). Record
@@ -405,7 +411,7 @@ contract. Do not widen scope to answer a finding.
 - Comparison or mutant copies come from `git clone` or `git worktree add`, never `cp -R` of a
   linked worktree.
 - Isolated HOME/XDG is for test and probe runs only; spawn, placement and delivery commands
-  (`pacelever`, `panewire`, `panewire`) run with the real HOME.
+  (`pacelever`, `panewire`) run with the real HOME.
 - Never ask a question in this pane — no confirmation prompt, no AskUserQuestion or other
   interactive chooser; nobody sees it and it blocks silently. On a decision emit
   `panewire emit --kind lane.event --lane <parent-lane> --type decision --event-id <job>-decision-<n> --text '[<job>] ESC | <question> | options: <A>/<B> | default: <A>'`

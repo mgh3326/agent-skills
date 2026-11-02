@@ -1,6 +1,6 @@
 # spawn — 기동·주입·착지·task 연결
 
-**launcher 는 `panewire` 하나다.** 한 task 에는 한 번만 제출한다(같은 live claim 의 재제출은 rc 74).
+**launcher 는 `panewire` 하나다.** 네트워크 응답 유실 뒤에는 같은 명령과 저장된 request key로만 재시도한다. 이 재전송은 기존 예약을 조회·재사용한다. 별도 key/job으로 같은 live task를 새로 claim하면 rc 74이며, 미확인 소유권을 우회하지 않는다.
 플래그 정본은 `panewire <cmd> --help` 와 panewire README·`DESIGN.md`·`docs/config.md`(exit code 표)다.
 
 | 일 | 명령 |
@@ -22,7 +22,7 @@ mergewake reap 이 한다.
 
 - kiro 워커: "Linear는 읽기만, 이슈·코멘트 변경 금지" 필수(kiro Linear MCP는 write 가능).
 - 무인 워커의 승인 우회 플래그는 panewire 하네스 launch 에 내장돼 있다. mock 레인은 `-L mock` +
-  `MOCK_MCP_PROFILE` + `WRK_MOCK_MCP_CONFIG` 이고 claude·codex 만 된다(그 외·원격 mock 은 rc 79).
+  `MOCK_MCP_PROFILE` + `PANEWIRE_MOCK_MCP_CONFIG` 이고 claude·codex 만 된다(그 외·원격 mock 은 rc 79).
 - **스폰 = handoffkeep tasks 기록 의무**: panewire spawn 은 숫자 task binding 없이는 거부한다. 자기
   task 는 `--task <id>`, 아니면 부모 잡을 상속한다 — `--parent-job <부모잡>`, 아무것도 안 주면 pane
   의 `ARBITER_JOB`(스폰된 pane 에 실린다). 잡 상속은 `--report` 가 필수이고 task 를 다시 claim 하지

@@ -56,7 +56,7 @@
 | 감시하던 것 | panewire 이벤트 | 배포 판 | 근거 |
 |---|---|---|---|
 | 프롬프트 착지 증명 | `panewire prompt --uptake` 관측(confirmed/unproven/composer_residue) | **있음** | prompt·wait 경로 두 판; 제출 증명은 claude·codex 만, 그 외 하네스는 unproven(`relay.md` §3-2) |
-| 스폰 요청·결과 | `spawn.requested`·`spawn.result` 허브 broadcast | **있음 — 허브 내부/UI · 노드 수신은 기능 있음/desktop 미설정** | hub_spawn.go 두 판. 노드는 허브 HTTP 가 아니라 WS `job.spawn` 메시지를 받아 handleHubSpawn(hub_spawn_node.go)이 처리한다 — #48(56cdf3e)부터 배포 판에 있음. desktop 에서 꺼져 있는 이유는 판이 아니라 `~/.config/panewire/spawn.json` 부재다(실측: 파일 없음 → "spawn disabled") |
+| 스폰 요청·결과 | `SPAWNED` / `SPAWN_FAILED`를 담은 owner/parent `lane.event` + hk job 이벤트 | **흡수 컷오버(#155/#157) 배포 후 사용** | `/v1/spawns`의 durable 예약 뒤 비동기 결과를 outbox로 전달한다. `ACCEPTED`는 착지 증거가 아니다. bounded `inbox wait`와 실패 처리는 `watching.md` §스폰 후 대기. 기존 저수준 `spawn.requested`·`spawn.result` broadcast는 세션 알림 경로가 아니다. |
 | 레인 라우트 변경 | `lanes.changed` 허브 broadcast | **있음 — 허브 내부/UI** | lanes_write.go @e401923 |
 | 릴레이 진단 | `relay.unrouted`·`rejected`·`truncated`·`unconfirmed` 등 | **있음 — 허브 내부/UI** | relay.go·relay_ack.go @e401923 |
 | 버스트·failover | burst request/hold·Wake-on-LAN·전원 | **있음** | burst*.go·failover(#17·#19·#20) 두 판 |
