@@ -33,8 +33,7 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
   `git ls-remote` before acting on it.
 - **No polling loops.** Wait for the pushed event or one bounded blocking wait
   (`watching.md`). A missing event is a task for panewire, not a loop.
-- **One launcher per task.** `panewire spawn` only; never submit the same live task twice
-  (a duplicate live claim exits 74). Quota is `pacelever`; review and post-merge cleanup are
+- **One launcher per task.** Use `panewire spawn`; a network retry replays the same saved request and key. Never create another live job or override unresolved ownership (a fresh duplicate claim exits 74). Quota is `pacelever`; review and post-merge cleanup are
   `mergewake`.
 - **Every packet and brief carries `comms-contract: v1`** (`relay.md` §3-1).
 - **Identify a sender by session name, role and lane**, never by model name.
