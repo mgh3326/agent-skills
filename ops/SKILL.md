@@ -46,7 +46,8 @@ anything here. Unset or missing is normal — the abstract rules below apply alo
   commands (`pacelever`, `runtug spawn|done|escalate`, `panewire`) use the real HOME.
 - **A test harness that does a real spawn stops its completion watchers before removing
   its temp root**; signal only pids it started.
-- **On macOS hosts run Go suites with `go test -p 2`** — wider parallelism stalls in syspolicyd.
+- **Test only what you changed, on any host** — e.g. `go test -p 2 ./<changed pkg>/...` or the touched
+  pytest files; full suites are CI's job. On macOS keep `-p 2`: wider parallelism stalls in syspolicyd.
 
 ## Routing table
 
